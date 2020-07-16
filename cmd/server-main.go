@@ -492,7 +492,7 @@ func serverMain(ctx *cli.Context) {
 	}
 
 	if path := globalCLIContext.WritePortFile; path != "" {
-		err = ioutil.WriteFile(path, []byte(globalMinioPort), 0644)
+		err = writePortFile(path)
 		logger.FatalIf(err, "Error write port to path %s", path)
 	}
 
@@ -566,6 +566,27 @@ func serverMain(ctx *cli.Context) {
 	}
 
 	handleSignals()
+}
+
+func writePortFile(path string) error {
+	f, err := ioutil.TempFile("", "")
+	if err != nil {
+		return err
+	}
+	tmpname := f.Name()
+	if _, err = f.Write([]byte(globalMinioPort)); err != nil {
+		os.Remove(tmpname)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		os.Remove(tmpname)
+		return err
+	}
+	if err = os.Rename(tmpname, path); err != nil {
+		os.Remove(tmpname)
+		return err
+	}
+	return nil
 }
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
