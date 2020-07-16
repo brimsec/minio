@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -47,6 +48,11 @@ var ServerFlags = []cli.Flag{
 		Name:  "address",
 		Value: ":" + GlobalMinioDefaultPort,
 		Usage: "bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname",
+	},
+	cli.StringFlag{
+		Name:  "writeportfile",
+		Value: "",
+		Usage: "write port number to file path",
 	},
 }
 
@@ -465,14 +471,30 @@ func serverMain(ctx *cli.Context) {
 		}
 	}()
 
+	listenerAddrCh := make(chan net.Addr)
 	httpServer := xhttp.NewServer([]string{globalMinioAddr}, criticalErrorHandler{corsHandler(handler)}, getCert)
 	httpServer.ErrorLog = log.New(pw, "", 0)
 	httpServer.BaseContext = func(listener net.Listener) context.Context {
+		listenerAddrCh <- listener.Addr()
 		return GlobalContext
 	}
 	go func() {
 		globalHTTPServerErrorCh <- httpServer.Start()
 	}()
+
+	// Await listener and set from addr. This covers the case where
+	// globalMinioPort is set to 0 and therefore a port is randomly assigned.
+	select {
+	case addr := <-listenerAddrCh:
+		_, globalMinioPort, err = net.SplitHostPort(addr.String())
+		logger.FatalIf(err, "Unable to get port from addr %q", addr)
+	case <-globalHTTPServerErrorCh:
+	}
+
+	if path := globalCLIContext.WritePortFile; path != "" {
+		err = ioutil.WriteFile(path, []byte(globalMinioPort), 0644)
+		logger.FatalIf(err, "Error write port to path %s", path)
+	}
 
 	globalObjLayerMutex.Lock()
 	globalHTTPServer = httpServer

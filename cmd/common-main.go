@@ -149,6 +149,8 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 		globalCLIContext.Addr = ctx.String("address")
 	}
 
+	globalCLIContext.WritePortFile = ctx.String("writeportfile")
+
 	// Check "no-compat" flag from command line argument.
 	globalCLIContext.StrictS3Compat = true
 	if ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat") {
