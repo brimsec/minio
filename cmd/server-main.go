@@ -27,6 +27,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -572,7 +573,8 @@ func serverMain(ctx *cli.Context) {
 }
 
 func writePortFile(path string) error {
-	f, err := ioutil.TempFile("", "")
+	dir := filepath.Dir(path)
+	f, err := ioutil.TempFile(dir, "")
 	if err != nil {
 		return err
 	}

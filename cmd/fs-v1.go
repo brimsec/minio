@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -1266,6 +1267,17 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	return ObjectInfo{Bucket: bucket, Name: object}, nil
 }
 
+// pathJoin - like path.Join() but retains trailing SlashSeparator of the last element
+func filepathJoin(elem ...string) string {
+	trailingSlash := ""
+	if len(elem) > 0 {
+		if HasSuffix(elem[len(elem)-1], string(filepath.Separator)) {
+			trailingSlash = string(filepath.Separator)
+		}
+	}
+	return filepath.Join(elem...) + trailingSlash
+}
+
 // Returns function "listDir" of the type listDirFunc.
 // isLeaf - is used by listDir function to check if an entry
 // is a leaf or non-leaf entry.
@@ -1273,7 +1285,7 @@ func (fs *FSObjects) listDirFactory() ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string) {
 		var err error
-		entries, err = readDir(pathJoin(fs.fsPath, bucket, prefixDir))
+		entries, err = readDir(filepathJoin(fs.fsPath, bucket, prefixDir))
 		if err != nil && err != errFileNotFound {
 			logger.LogIf(GlobalContext, err)
 			return false, nil
