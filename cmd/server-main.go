@@ -479,21 +479,19 @@ func serverMain(ctx *cli.Context) {
 		return GlobalContext
 	}
 	go func() {
-		globalHTTPServerErrorCh <- httpServer.Start()
+		err := httpServer.Start()
+		if err != nil {
+			close(listenerAddrCh)
+		}
+		globalHTTPServerErrorCh <- err
 	}()
 
 	// Await listener and set from addr. This covers the case where
 	// globalMinioPort is set to 0 and therefore a port is randomly assigned.
-	select {
-	case addr := <-listenerAddrCh:
+	addr := <-listenerAddrCh
+	if addr != nil {
 		_, globalMinioPort, err = net.SplitHostPort(addr.String())
 		logger.FatalIf(err, "Unable to get port from addr %q", addr)
-	case <-globalHTTPServerErrorCh:
-	}
-
-	if path := globalCLIContext.WritePortFile; path != "" {
-		err = writePortFile(path)
-		logger.FatalIf(err, "Error write port to path %s", path)
 	}
 
 	globalObjLayerMutex.Lock()
@@ -556,6 +554,11 @@ func serverMain(ctx *cli.Context) {
 	globalObjLayerMutex.Lock()
 	globalSafeMode = false
 	globalObjLayerMutex.Unlock()
+
+	if path := globalCLIContext.WritePortFile; path != "" {
+		err = writePortFile(path)
+		logger.FatalIf(err, "Error write port to path %s", path)
+	}
 
 	// Prints the formatted startup message once object layer is initialized.
 	printStartupMessage(getAPIEndpoints())
