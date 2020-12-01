@@ -20,9 +20,13 @@ import (
 	"crypto/x509"
 	"encoding/gob"
 	"errors"
+	"fmt"
+	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -30,6 +34,7 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/config"
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/certs"
@@ -40,15 +45,14 @@ func init() {
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	// Initialize globalConsoleSys system
-	globalConsoleSys = NewConsoleLogger(GlobalContext)
-	logger.AddTarget(globalConsoleSys)
+	rand.Seed(time.Now().UTC().UnixNano())
+	globalDNSCache = xhttp.NewDNSCache(3*time.Second, 10*time.Second)
 
 	gob.Register(StorageErr(""))
 }
 
 func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
-	if (globalAutoEncryption || GlobalKMS != nil) && !objAPI.IsEncryptionSupported() {
+	if (GlobalKMS != nil) && !objAPI.IsEncryptionSupported() {
 		logger.Fatal(errInvalidArgument,
 			"Encryption support is requested but '%s' does not support encryption", name)
 	}
@@ -68,17 +72,40 @@ func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
 
 // Check for updates and print a notification message
 func checkUpdate(mode string) {
-	// Its OK to ignore any errors during doUpdate() here.
-	if updateMsg, _, currentReleaseTime, latestReleaseTime, err := getUpdateInfo(2*time.Second, mode); err == nil {
-		if updateMsg == "" {
-			return
-		}
-		if globalInplaceUpdateDisabled {
-			logStartupMessage(updateMsg)
-		} else {
-			logStartupMessage(prepareUpdateMessage("Run `mc admin update`", latestReleaseTime.Sub(currentReleaseTime)))
-		}
+	updateURL := minioReleaseInfoURL
+	if runtime.GOOS == globalWindowsOSName {
+		updateURL = minioReleaseWindowsInfoURL
 	}
+
+	u, err := url.Parse(updateURL)
+	if err != nil {
+		return
+	}
+
+	// Its OK to ignore any errors during doUpdate() here.
+	crTime, err := GetCurrentReleaseTime()
+	if err != nil {
+		return
+	}
+
+	_, lrTime, err := getLatestReleaseTime(u, 2*time.Second, mode)
+	if err != nil {
+		return
+	}
+
+	var older time.Duration
+	var downloadURL string
+	if lrTime.After(crTime) {
+		older = lrTime.Sub(crTime)
+		downloadURL = getDownloadURL(releaseTimeToReleaseTag(lrTime))
+	}
+
+	updateMsg := prepareUpdateMessage(downloadURL, older)
+	if updateMsg == "" {
+		return
+	}
+
+	logStartupMessage(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
 }
 
 func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() string) (*ConfigDir, bool) {
@@ -225,7 +252,11 @@ func handleCommonEnvVars() {
 	} else {
 		// Add found interfaces IP address to global domain IPS,
 		// loopback addresses will be naturally dropped.
-		updateDomainIPs(mustGetLocalIP4())
+		domainIPs := mustGetLocalIP4()
+		for _, host := range globalEndpoints.Hostnames() {
+			domainIPs.Add(host)
+		}
+		updateDomainIPs(domainIPs)
 	}
 
 	// In place update is true by default if the MINIO_UPDATE is not set
@@ -262,7 +293,7 @@ func logStartupMessage(msg string) {
 	logger.StartupMessage(msg)
 }
 
-func getTLSConfig() (x509Certs []*x509.Certificate, c *certs.Certs, secureConn bool, err error) {
+func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secureConn bool, err error) {
 	if !(isFile(getPublicCertFile()) && isFile(getPrivateKeyFile())) {
 		return nil, nil, false, nil
 	}
@@ -271,11 +302,71 @@ func getTLSConfig() (x509Certs []*x509.Certificate, c *certs.Certs, secureConn b
 		return nil, nil, false, err
 	}
 
-	c, err = certs.New(getPublicCertFile(), getPrivateKeyFile(), config.LoadX509KeyPair)
+	manager, err = certs.NewManager(GlobalContext, getPublicCertFile(), getPrivateKeyFile(), config.LoadX509KeyPair)
 	if err != nil {
 		return nil, nil, false, err
 	}
 
+	// MinIO has support for multiple certificates. It expects the following structure:
+	//  certs/
+	//   │
+	//   ├─ public.crt
+	//   ├─ private.key
+	//   │
+	//   ├─ example.com/
+	//   │   │
+	//   │   ├─ public.crt
+	//   │   └─ private.key
+	//   └─ foobar.org/
+	//      │
+	//      ├─ public.crt
+	//      └─ private.key
+	//   ...
+	//
+	// Therefore, we read all filenames in the cert directory and check
+	// for each directory whether it contains a public.crt and private.key.
+	// If so, we try to add it to certificate manager.
+	root, err := os.Open(globalCertsDir.Get())
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer root.Close()
+
+	files, err := root.Readdir(-1)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	for _, file := range files {
+		// Ignore all
+		// - regular files
+		// - "CAs" directory
+		// - any directory which starts with ".."
+		if file.Mode().IsRegular() || file.Name() == "CAs" || strings.HasPrefix(file.Name(), "..") {
+			continue
+		}
+		if file.Mode()&os.ModeSymlink == os.ModeSymlink {
+			file, err = os.Stat(filepath.Join(root.Name(), file.Name()))
+			if err != nil {
+				// not accessible ignore
+				continue
+			}
+			if !file.IsDir() {
+				continue
+			}
+		}
+
+		var (
+			certFile = filepath.Join(root.Name(), file.Name(), publicCertFile)
+			keyFile  = filepath.Join(root.Name(), file.Name(), privateKeyFile)
+		)
+		if !isFile(certFile) || !isFile(keyFile) {
+			continue
+		}
+		if err = manager.AddCertificate(certFile, keyFile); err != nil {
+			err = fmt.Errorf("Unable to load TLS certificate '%s,%s': %w", certFile, keyFile, err)
+			logger.LogIf(GlobalContext, err, logger.Minio)
+		}
+	}
 	secureConn = true
-	return x509Certs, c, secureConn, nil
+	return x509Certs, manager, secureConn, nil
 }

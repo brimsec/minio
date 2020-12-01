@@ -19,6 +19,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -42,6 +43,7 @@ func TestRepeatPutObjectPart(t *testing.T) {
 	}
 
 	// cleaning up of temporary test directories
+	defer objLayer.Shutdown(context.Background())
 	defer removeRoots(disks)
 
 	err = objLayer.MakeBucketWithLocation(ctx, "bucket1", BucketOptions{})
@@ -90,6 +92,7 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer xl.Shutdown(context.Background())
 
 	err = xl.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
 	if err != nil {
@@ -130,8 +133,8 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 		for _, dir := range fsDirs {
 			defer os.RemoveAll(dir)
 		}
-		z := obj.(*erasureZones)
-		xl := z.zones[0].sets[0]
+		z := obj.(*erasureServerSets)
+		xl := z.serverSets[0].sets[0]
 		objs = append(objs, xl)
 	}
 
@@ -191,6 +194,13 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
+	restoreGlobalStorageClass := globalStorageClass
+	defer func() {
+		globalStorageClass = restoreGlobalStorageClass
+	}()
+
+	globalStorageClass = storageclass.Config{}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -200,10 +210,11 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories
+	defer obj.Shutdown(context.Background())
 	defer removeRoots(fsDirs)
 
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 
 	// Create "bucket"
 	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
@@ -222,15 +233,15 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 	// for a 16 disk setup, quorum is 9. To simulate disks not found yet
 	// quorum is available, we remove disks leaving quorum disks behind.
 	erasureDisks := xl.getDisks()
-	z.zones[0].erasureDisksMu.Lock()
+	z.serverSets[0].erasureDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
-		for i := range erasureDisks[:7] {
+		for i := range erasureDisks[:4] {
 			erasureDisks[i] = newNaughtyDisk(erasureDisks[i], nil, errFaultyDisk)
 		}
 		return erasureDisks
 	}
 
-	z.zones[0].erasureDisksMu.Unlock()
+	z.serverSets[0].erasureDisksMu.Unlock()
 	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -244,17 +255,17 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 
 	// Remove one more disk to 'lose' quorum, by setting it to nil.
 	erasureDisks = xl.getDisks()
-	z.zones[0].erasureDisksMu.Lock()
+	z.serverSets[0].erasureDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
 		erasureDisks[7] = nil
 		erasureDisks[8] = nil
 		return erasureDisks
 	}
 
-	z.zones[0].erasureDisksMu.Unlock()
+	z.serverSets[0].erasureDisksMu.Unlock()
 	_, err = obj.DeleteObject(ctx, bucket, object, ObjectOptions{})
 	// since majority of disks are not available, metaquorum is not achieved and hence errErasureWriteQuorum error
-	if err != toObjectErr(errErasureWriteQuorum, bucket, object) {
+	if !errors.Is(err, errErasureWriteQuorum) {
 		t.Errorf("Expected deleteObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 	}
 }
@@ -269,10 +280,11 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories.
+	defer obj.Shutdown(context.Background())
 	defer removeRoots(fsDirs)
 
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 
 	// Create "bucket"
 	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
@@ -307,11 +319,11 @@ func TestGetObjectNoQuorum(t *testing.T) {
 				erasureDisks[i] = newNaughtyDisk(erasureDisks[i], diskErrors, errFaultyDisk)
 			}
 		}
-		z.zones[0].erasureDisksMu.Lock()
+		z.serverSets[0].erasureDisksMu.Lock()
 		xl.getDisks = func() []StorageAPI {
 			return erasureDisks
 		}
-		z.zones[0].erasureDisksMu.Unlock()
+		z.serverSets[0].erasureDisksMu.Unlock()
 		// Fetch object from store.
 		err = xl.GetObject(ctx, bucket, object, 0, int64(len("abcd")), ioutil.Discard, "", opts)
 		if err != toObjectErr(errErasureReadQuorum, bucket, object) {
@@ -331,10 +343,11 @@ func TestPutObjectNoQuorum(t *testing.T) {
 	}
 
 	// Cleanup backend directories.
+	defer obj.Shutdown(context.Background())
 	defer removeRoots(fsDirs)
 
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 
 	// Create "bucket"
 	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
@@ -369,14 +382,14 @@ func TestPutObjectNoQuorum(t *testing.T) {
 				erasureDisks[i] = newNaughtyDisk(erasureDisks[i], diskErrors, errFaultyDisk)
 			}
 		}
-		z.zones[0].erasureDisksMu.Lock()
+		z.serverSets[0].erasureDisksMu.Lock()
 		xl.getDisks = func() []StorageAPI {
 			return erasureDisks
 		}
-		z.zones[0].erasureDisksMu.Unlock()
+		z.serverSets[0].erasureDisksMu.Unlock()
 		// Upload new content to same object "object"
 		_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), opts)
-		if err != toObjectErr(errErasureWriteQuorum, bucket, object) {
+		if !errors.Is(err, errErasureWriteQuorum) {
 			t.Errorf("Expected putObject to fail with %v, but failed with %v", toObjectErr(errErasureWriteQuorum, bucket, object), err)
 		}
 	}
@@ -392,6 +405,8 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 		globalStorageClass = restoreGlobalStorageClass
 	}()
 
+	globalStorageClass = storageclass.Config{}
+
 	bucket := getRandomBucketName()
 
 	var opts ObjectOptions
@@ -399,8 +414,8 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	partCount := 3
 	data := bytes.Repeat([]byte("a"), 6*1024*1024*partCount)
 
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 	erasureDisks := xl.getDisks()
 
 	ctx, cancel := context.WithCancel(GlobalContext)
@@ -419,6 +434,7 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts1, errs1 := readAllFileInfo(ctx, erasureDisks, bucket, object1, "")
+	parts1SC := globalStorageClass
 
 	// Object for test case 2 - No StorageClass defined, MetaData in PutObject requesting RRS Class
 	object2 := "object2"
@@ -430,6 +446,7 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts2, errs2 := readAllFileInfo(ctx, erasureDisks, bucket, object2, "")
+	parts2SC := globalStorageClass
 
 	// Object for test case 3 - No StorageClass defined, MetaData in PutObject requesting Standard Storage Class
 	object3 := "object3"
@@ -441,6 +458,7 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts3, errs3 := readAllFileInfo(ctx, erasureDisks, bucket, object3, "")
+	parts3SC := globalStorageClass
 
 	// Object for test case 4 - Standard StorageClass defined as Parity 6, MetaData in PutObject requesting Standard Storage Class
 	object4 := "object4"
@@ -458,6 +476,11 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts4, errs4 := readAllFileInfo(ctx, erasureDisks, bucket, object4, "")
+	parts4SC := storageclass.Config{
+		Standard: storageclass.StorageClass{
+			Parity: 6,
+		},
+	}
 
 	// Object for test case 5 - RRS StorageClass defined as Parity 2, MetaData in PutObject requesting RRS Class
 	// Reset global storage class flags
@@ -476,6 +499,11 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts5, errs5 := readAllFileInfo(ctx, erasureDisks, bucket, object5, "")
+	parts5SC := storageclass.Config{
+		RRS: storageclass.StorageClass{
+			Parity: 2,
+		},
+	}
 
 	// Object for test case 6 - RRS StorageClass defined as Parity 2, MetaData in PutObject requesting Standard Storage Class
 	object6 := "object6"
@@ -493,12 +521,17 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts6, errs6 := readAllFileInfo(ctx, erasureDisks, bucket, object6, "")
+	parts6SC := storageclass.Config{
+		RRS: storageclass.StorageClass{
+			Parity: 2,
+		},
+	}
 
 	// Object for test case 7 - Standard StorageClass defined as Parity 5, MetaData in PutObject requesting RRS Class
 	// Reset global storage class flags
 	object7 := "object7"
 	metadata7 := make(map[string]string)
-	metadata7["x-amz-storage-class"] = storageclass.RRS
+	metadata7["x-amz-storage-class"] = storageclass.STANDARD
 	globalStorageClass = storageclass.Config{
 		Standard: storageclass.StorageClass{
 			Parity: 5,
@@ -511,26 +544,33 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts7, errs7 := readAllFileInfo(ctx, erasureDisks, bucket, object7, "")
+	parts7SC := storageclass.Config{
+		Standard: storageclass.StorageClass{
+			Parity: 5,
+		},
+	}
 
 	tests := []struct {
 		parts               []FileInfo
 		errs                []error
 		expectedReadQuorum  int
 		expectedWriteQuorum int
+		storageClassCfg     storageclass.Config
 		expectedError       error
 	}{
-		{parts1, errs1, 8, 9, nil},
-		{parts2, errs2, 14, 15, nil},
-		{parts3, errs3, 8, 9, nil},
-		{parts4, errs4, 10, 11, nil},
-		{parts5, errs5, 14, 15, nil},
-		{parts6, errs6, 8, 9, nil},
-		{parts7, errs7, 14, 15, nil},
+		{parts1, errs1, 12, 12, parts1SC, nil},
+		{parts2, errs2, 14, 14, parts2SC, nil},
+		{parts3, errs3, 12, 12, parts3SC, nil},
+		{parts4, errs4, 10, 10, parts4SC, nil},
+		{parts5, errs5, 14, 14, parts5SC, nil},
+		{parts6, errs6, 12, 12, parts6SC, nil},
+		{parts7, errs7, 11, 11, parts7SC, nil},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.(*testing.T).Run("", func(t *testing.T) {
-			actualReadQuorum, actualWriteQuorum, err := objectQuorumFromMeta(ctx, *xl, tt.parts, tt.errs)
+			globalStorageClass = tt.storageClassCfg
+			actualReadQuorum, actualWriteQuorum, err := objectQuorumFromMeta(ctx, tt.parts, tt.errs)
 			if tt.expectedError != nil && err == nil {
 				t.Errorf("Expected %s, got %s", tt.expectedError, err)
 			}

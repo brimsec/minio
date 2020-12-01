@@ -24,7 +24,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/bucket/lifecycle"
 	"github.com/minio/minio/pkg/event"
@@ -41,8 +40,8 @@ var (
 //  x-amz-copy-source-if-unmodified-since
 //  x-amz-copy-source-if-match
 //  x-amz-copy-source-if-none-match
-func checkCopyObjectPartPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo, encETag string) bool {
-	return checkCopyObjectPreconditions(ctx, w, r, objInfo, encETag)
+func checkCopyObjectPartPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo) bool {
+	return checkCopyObjectPreconditions(ctx, w, r, objInfo)
 }
 
 // Validates the preconditions for CopyObject, returns true if CopyObject operation should not proceed.
@@ -51,13 +50,10 @@ func checkCopyObjectPartPreconditions(ctx context.Context, w http.ResponseWriter
 //  x-amz-copy-source-if-unmodified-since
 //  x-amz-copy-source-if-match
 //  x-amz-copy-source-if-none-match
-func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo, encETag string) bool {
+func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo) bool {
 	// Return false for methods other than GET and HEAD.
 	if r.Method != http.MethodPut {
 		return false
-	}
-	if encETag == "" {
-		encETag = objInfo.ETag
 	}
 	// If the object doesn't have a modtime (IsZero), or the modtime
 	// is obviously garbage (Unix time == 0), then ignore modtimes
@@ -106,17 +102,11 @@ func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r 
 		}
 	}
 
-	shouldDecryptEtag := crypto.SSECopy.IsRequested(r.Header) && !crypto.IsMultiPart(objInfo.UserDefined)
-
 	// x-amz-copy-source-if-match : Return the object only if its entity tag (ETag) is the
 	// same as the one specified; otherwise return a 412 (precondition failed).
 	ifMatchETagHeader := r.Header.Get(xhttp.AmzCopySourceIfMatch)
 	if ifMatchETagHeader != "" {
-		etag := objInfo.ETag
-		if shouldDecryptEtag {
-			etag = encETag[len(encETag)-32:]
-		}
-		if objInfo.ETag != "" && !isETagEqual(etag, ifMatchETagHeader) {
+		if !isETagEqual(objInfo.ETag, ifMatchETagHeader) {
 			// If the object ETag does not match with the specified ETag.
 			writeHeaders()
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL, guessIsBrowserReq(r))
@@ -128,11 +118,7 @@ func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r 
 	// one specified otherwise, return a 304 (not modified).
 	ifNoneMatchETagHeader := r.Header.Get(xhttp.AmzCopySourceIfNoneMatch)
 	if ifNoneMatchETagHeader != "" {
-		etag := objInfo.ETag
-		if shouldDecryptEtag {
-			etag = encETag[len(encETag)-32:]
-		}
-		if objInfo.ETag != "" && isETagEqual(etag, ifNoneMatchETagHeader) {
+		if isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
 			// If the object ETag matches with the specified ETag.
 			writeHeaders()
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL, guessIsBrowserReq(r))
@@ -275,18 +261,20 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
 		}
 	}
 
-	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
-		ruleID, expiryTime := lc.PredictExpiryTime(lifecycle.ObjectOpts{
-			Name:         objInfo.Name,
-			UserTags:     objInfo.UserTags,
-			VersionID:    objInfo.VersionID,
-			ModTime:      objInfo.ModTime,
-			IsLatest:     objInfo.IsLatest,
-			DeleteMarker: objInfo.DeleteMarker,
-		})
-		if !expiryTime.IsZero() {
-			w.Header()[xhttp.AmzExpiration] = []string{
-				fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, expiryTime.Format(http.TimeFormat), ruleID),
+	if objInfo.Bucket != "" {
+		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
+			ruleID, expiryTime := lc.PredictExpiryTime(lifecycle.ObjectOpts{
+				Name:         objInfo.Name,
+				UserTags:     objInfo.UserTags,
+				VersionID:    objInfo.VersionID,
+				ModTime:      objInfo.ModTime,
+				IsLatest:     objInfo.IsLatest,
+				DeleteMarker: objInfo.DeleteMarker,
+			})
+			if !expiryTime.IsZero() {
+				w.Header()[xhttp.AmzExpiration] = []string{
+					fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, expiryTime.Format(http.TimeFormat), ruleID),
+				}
 			}
 		}
 	}
@@ -295,37 +283,28 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
 // deleteObject is a convenient wrapper to delete an object, this
 // is a common function to be called from object handlers and
 // web handlers.
-func deleteObject(ctx context.Context, obj ObjectLayer, cache CacheObjectLayer, bucket, object string, r *http.Request, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+func deleteObject(ctx context.Context, obj ObjectLayer, cache CacheObjectLayer, bucket, object string, w http.ResponseWriter, r *http.Request, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	deleteObject := obj.DeleteObject
 	if cache != nil {
 		deleteObject = cache.DeleteObject
 	}
 	// Proceed to delete the object.
-	if objInfo, err = deleteObject(ctx, bucket, object, opts); err != nil {
-		return objInfo, err
-	}
-
-	// Requesting only a delete marker which was successfully attempted.
-	if objInfo.DeleteMarker {
+	objInfo, err = deleteObject(ctx, bucket, object, opts)
+	if objInfo.Name != "" {
+		eventName := event.ObjectRemovedDelete
+		if objInfo.DeleteMarker {
+			eventName = event.ObjectRemovedDeleteMarkerCreated
+		}
 		// Notify object deleted marker event.
 		sendEvent(eventArgs{
-			EventName:  event.ObjectRemovedDeleteMarkerCreated,
-			BucketName: bucket,
-			Object:     objInfo,
-			ReqParams:  extractReqParams(r),
-			UserAgent:  r.UserAgent(),
-			Host:       handlers.GetSourceIP(r),
-		})
-	} else {
-		// Notify object deleted event.
-		sendEvent(eventArgs{
-			EventName:  event.ObjectRemovedDelete,
-			BucketName: bucket,
-			Object:     objInfo,
-			ReqParams:  extractReqParams(r),
-			UserAgent:  r.UserAgent(),
-			Host:       handlers.GetSourceIP(r),
+			EventName:    eventName,
+			BucketName:   bucket,
+			Object:       objInfo,
+			ReqParams:    extractReqParams(r),
+			RespElements: extractRespElements(w),
+			UserAgent:    r.UserAgent(),
+			Host:         handlers.GetSourceIP(r),
 		})
 	}
-	return objInfo, nil
+	return objInfo, err
 }

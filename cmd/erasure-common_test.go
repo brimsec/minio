@@ -32,6 +32,7 @@ func TestErasureParentDirIsObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to initialize 'Erasure' object layer.")
 	}
+	defer obj.Shutdown(context.Background())
 
 	// Remove all disks.
 	for _, disk := range fsDisks {
@@ -54,8 +55,8 @@ func TestErasureParentDirIsObject(t *testing.T) {
 		t.Fatalf("Unexpected object name returned got %s, expected %s", objInfo.Name, objectName)
 	}
 
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 	testCases := []struct {
 		parentIsObject bool
 		objectName     string

@@ -83,7 +83,7 @@ func TestCommonTime(t *testing.T) {
 	for i, testCase := range testCases {
 		// Obtain a common mod time from modTimes slice.
 		ctime, _ := commonTime(testCase.times)
-		if testCase.time != ctime {
+		if !testCase.time.Equal(ctime) {
 			t.Fatalf("Test case %d, expect to pass but failed. Wanted modTime: %s, got modTime: %s\n", i+1, testCase.time, ctime)
 		}
 	}
@@ -99,6 +99,7 @@ func TestListOnlineDisks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare Erasure backend failed - %v", err)
 	}
+	defer obj.Shutdown(context.Background())
 	defer removeRoots(disks)
 
 	type tamperKind int
@@ -177,8 +178,8 @@ func TestListOnlineDisks(t *testing.T) {
 
 	object := "object"
 	data := bytes.Repeat([]byte("a"), 1024)
-	z := obj.(*erasureZones)
-	erasureDisks := z.zones[0].sets[0].getDisks()
+	z := obj.(*erasureServerSets)
+	erasureDisks := z.serverSets[0].sets[0].getDisks()
 	for i, test := range testCases {
 		_, err = obj.PutObject(ctx, bucket, object, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), ObjectOptions{})
 		if err != nil {
@@ -210,7 +211,7 @@ func TestListOnlineDisks(t *testing.T) {
 				// and check if that disk
 				// appears in outDatedDisks.
 				tamperedIndex = index
-				dErr := erasureDisks[index].DeleteFile(bucket, pathJoin(object, fi.DataDir, "part.1"))
+				dErr := erasureDisks[index].Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), false)
 				if dErr != nil {
 					t.Fatalf("Test %d: Failed to delete %s - %v", i+1,
 						filepath.Join(object, "part.1"), dErr)
@@ -265,6 +266,7 @@ func TestDisksWithAllParts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare Erasure backend failed - %v", err)
 	}
+	defer obj.Shutdown(context.Background())
 	defer removeRoots(disks)
 
 	bucket := "bucket"
@@ -272,8 +274,8 @@ func TestDisksWithAllParts(t *testing.T) {
 	// make data with more than one part
 	partCount := 3
 	data := bytes.Repeat([]byte("a"), 6*1024*1024*partCount)
-	z := obj.(*erasureZones)
-	s := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	s := z.serverSets[0].sets[0]
 	erasureDisks := s.getDisks()
 	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
 	if err != nil {

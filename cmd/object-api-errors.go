@@ -22,12 +22,18 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strings"
 )
 
 // Converts underlying storage error. Convenience function written to
 // handle all cases where we have known types of errors returned by
 // underlying storage layer.
 func toObjectErr(err error, params ...string) error {
+	if len(params) > 1 {
+		if HasSuffix(params[1], globalDirSuffix) {
+			params[1] = strings.TrimSuffix(params[1], globalDirSuffix) + slashSeparator
+		}
+	}
 	switch err {
 	case errVolumeNotFound:
 		if len(params) >= 1 {
@@ -124,9 +130,27 @@ func toObjectErr(err error, params ...string) error {
 			}
 		}
 	case errErasureReadQuorum:
-		err = InsufficientReadQuorum{}
+		if len(params) == 1 {
+			err = InsufficientReadQuorum{
+				Bucket: params[0],
+			}
+		} else if len(params) >= 2 {
+			err = InsufficientReadQuorum{
+				Bucket: params[0],
+				Object: params[1],
+			}
+		}
 	case errErasureWriteQuorum:
-		err = InsufficientWriteQuorum{}
+		if len(params) == 1 {
+			err = InsufficientWriteQuorum{
+				Bucket: params[0],
+			}
+		} else if len(params) >= 2 {
+			err = InsufficientWriteQuorum{
+				Bucket: params[0],
+				Object: params[1],
+			}
+		}
 	case io.ErrUnexpectedEOF, io.ErrShortWrite:
 		err = IncompleteBody{}
 	case context.Canceled, context.DeadlineExceeded:
@@ -157,17 +181,27 @@ func (e SlowDown) Error() string {
 }
 
 // InsufficientReadQuorum storage cannot satisfy quorum for read operation.
-type InsufficientReadQuorum struct{}
+type InsufficientReadQuorum GenericError
 
 func (e InsufficientReadQuorum) Error() string {
-	return "Storage resources are insufficient for the read operation."
+	return "Storage resources are insufficient for the read operation " + e.Bucket + "/" + e.Object
+}
+
+// Unwrap the error.
+func (e InsufficientReadQuorum) Unwrap() error {
+	return errErasureReadQuorum
 }
 
 // InsufficientWriteQuorum storage cannot satisfy quorum for write operation.
-type InsufficientWriteQuorum struct{}
+type InsufficientWriteQuorum GenericError
 
 func (e InsufficientWriteQuorum) Error() string {
-	return "Storage resources are insufficient for the write operation."
+	return "Storage resources are insufficient for the write operation " + e.Bucket + "/" + e.Object
+}
+
+// Unwrap the error.
+func (e InsufficientWriteQuorum) Unwrap() error {
+	return errErasureWriteQuorum
 }
 
 // GenericError - generic object layer error.
@@ -176,6 +210,11 @@ type GenericError struct {
 	Object    string
 	VersionID string
 	Err       error
+}
+
+// Unwrap the error to its underlying error.
+func (e GenericError) Unwrap() error {
+	return e.Err
 }
 
 // InvalidArgument incorrect input argument
@@ -216,7 +255,14 @@ func (e BucketNotEmpty) Error() string {
 	return "Bucket not empty: " + e.Bucket
 }
 
-// VersionNotFound object does not exist.
+// InvalidVersionID invalid version id
+type InvalidVersionID GenericError
+
+func (e InvalidVersionID) Error() string {
+	return "Invalid version id: " + e.Bucket + "/" + e.Object + "(" + e.VersionID + ")"
+}
+
+// VersionNotFound version does not exist.
 type VersionNotFound GenericError
 
 func (e VersionNotFound) Error() string {
@@ -346,6 +392,90 @@ type BucketQuotaExceeded GenericError
 
 func (e BucketQuotaExceeded) Error() string {
 	return "Bucket quota exceeded for bucket: " + e.Bucket
+}
+
+// BucketReplicationConfigNotFound - no bucket replication config found
+type BucketReplicationConfigNotFound GenericError
+
+func (e BucketReplicationConfigNotFound) Error() string {
+	return "The replication configuration was not found: " + e.Bucket
+}
+
+// BucketRemoteDestinationNotFound bucket does not exist.
+type BucketRemoteDestinationNotFound GenericError
+
+func (e BucketRemoteDestinationNotFound) Error() string {
+	return "Destination bucket does not exist: " + e.Bucket
+}
+
+// BucketReplicationDestinationMissingLock bucket does not have object lock enabled.
+type BucketReplicationDestinationMissingLock GenericError
+
+func (e BucketReplicationDestinationMissingLock) Error() string {
+	return "Destination bucket does not have object lock enabled: " + e.Bucket
+}
+
+// BucketRemoteTargetNotFound remote target does not exist.
+type BucketRemoteTargetNotFound GenericError
+
+func (e BucketRemoteTargetNotFound) Error() string {
+	return "Remote target not found: " + e.Bucket
+}
+
+// BucketRemoteConnectionErr remote target connection failure.
+type BucketRemoteConnectionErr GenericError
+
+func (e BucketRemoteConnectionErr) Error() string {
+	return "Remote service endpoint or target bucket not available: " + e.Bucket
+}
+
+// BucketRemoteAlreadyExists remote already exists for this target type.
+type BucketRemoteAlreadyExists GenericError
+
+func (e BucketRemoteAlreadyExists) Error() string {
+	return "Remote already exists for this bucket: " + e.Bucket
+}
+
+// BucketRemoteLabelInUse remote already exists for this target label.
+type BucketRemoteLabelInUse GenericError
+
+func (e BucketRemoteLabelInUse) Error() string {
+	return "Remote with this label already exists for this bucket: " + e.Bucket
+}
+
+// BucketRemoteArnTypeInvalid arn type for remote is not valid.
+type BucketRemoteArnTypeInvalid GenericError
+
+func (e BucketRemoteArnTypeInvalid) Error() string {
+	return "Remote ARN type not valid: " + e.Bucket
+}
+
+// BucketRemoteArnInvalid arn needs to be specified.
+type BucketRemoteArnInvalid GenericError
+
+func (e BucketRemoteArnInvalid) Error() string {
+	return "Remote ARN has invalid format: " + e.Bucket
+}
+
+// BucketRemoteRemoveDisallowed when replication configuration exists
+type BucketRemoteRemoveDisallowed GenericError
+
+func (e BucketRemoteRemoveDisallowed) Error() string {
+	return "Replication configuration exists with this ARN:" + e.Bucket
+}
+
+// BucketRemoteTargetNotVersioned remote target does not have versioning enabled.
+type BucketRemoteTargetNotVersioned GenericError
+
+func (e BucketRemoteTargetNotVersioned) Error() string {
+	return "Remote target does not have versioning enabled: " + e.Bucket
+}
+
+// BucketReplicationSourceNotVersioned replication source does not have versioning enabled.
+type BucketReplicationSourceNotVersioned GenericError
+
+func (e BucketReplicationSourceNotVersioned) Error() string {
+	return "Replication source does not have versioning enabled: " + e.Bucket
 }
 
 /// Bucket related errors.

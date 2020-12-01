@@ -15,7 +15,6 @@
 package crypto
 
 import (
-	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -199,13 +198,13 @@ func (v *vaultService) DefaultKeyID() string {
 }
 
 // Info returns some information about the Vault,
-// configuration - like the endpoint or authentication
+// configuration - like the endpoints or authentication
 // method.
 func (v *vaultService) Info() KMSInfo {
 	return KMSInfo{
-		Endpoint: v.config.Endpoint,
-		Name:     v.DefaultKeyID(),
-		AuthType: v.config.Auth.Type,
+		Endpoints: []string{v.config.Endpoint},
+		Name:      v.DefaultKeyID(),
+		AuthType:  v.config.Auth.Type,
 	}
 }
 
@@ -224,11 +223,10 @@ func (v *vaultService) CreateKey(keyID string) error {
 // named key referenced by keyID. It also binds the generated key
 // cryptographically to the provided context.
 func (v *vaultService) GenerateKey(keyID string, ctx Context) (key [32]byte, sealedKey []byte, err error) {
-	var contextStream bytes.Buffer
-	ctx.WriteTo(&contextStream)
+	context := ctx.AppendTo(make([]byte, 0, 128))
 
 	payload := map[string]interface{}{
-		"context": base64.StdEncoding.EncodeToString(contextStream.Bytes()),
+		"context": base64.StdEncoding.EncodeToString(context),
 	}
 	s, err := v.client.Logical().Write(fmt.Sprintf("/transit/datakey/plaintext/%s", keyID), payload)
 	if err != nil {
@@ -260,12 +258,11 @@ func (v *vaultService) GenerateKey(keyID string, ctx Context) (key [32]byte, sea
 // The context must be same context as the one provided while
 // generating the plaintext key / sealedKey.
 func (v *vaultService) UnsealKey(keyID string, sealedKey []byte, ctx Context) (key [32]byte, err error) {
-	var contextStream bytes.Buffer
-	ctx.WriteTo(&contextStream)
+	context := ctx.AppendTo(make([]byte, 0, 128))
 
 	payload := map[string]interface{}{
 		"ciphertext": string(sealedKey),
-		"context":    base64.StdEncoding.EncodeToString(contextStream.Bytes()),
+		"context":    base64.StdEncoding.EncodeToString(context),
 	}
 
 	s, err := v.client.Logical().Write(fmt.Sprintf("/transit/decrypt/%s", keyID), payload)
@@ -294,12 +291,11 @@ func (v *vaultService) UnsealKey(keyID string, sealedKey []byte, ctx Context) (k
 // The context must be same context as the one provided while
 // generating the plaintext key / sealedKey.
 func (v *vaultService) UpdateKey(keyID string, sealedKey []byte, ctx Context) (rotatedKey []byte, err error) {
-	var contextStream bytes.Buffer
-	ctx.WriteTo(&contextStream)
+	context := ctx.AppendTo(make([]byte, 0, 128))
 
 	payload := map[string]interface{}{
 		"ciphertext": string(sealedKey),
-		"context":    base64.StdEncoding.EncodeToString(contextStream.Bytes()),
+		"context":    base64.StdEncoding.EncodeToString(context),
 	}
 	s, err := v.client.Logical().Write(fmt.Sprintf("/transit/rewrap/%s", keyID), payload)
 	if err != nil {

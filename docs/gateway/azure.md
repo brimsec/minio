@@ -7,7 +7,6 @@ MinIO Gateway adds Amazon S3 compatibility to Microsoft Azure Blob Storage.
 docker run -p 9000:9000 --name azure-s3 \
  -e "MINIO_ACCESS_KEY=azurestorageaccountname" \
  -e "MINIO_SECRET_KEY=azurestorageaccountkey" \
- -e "MINIO_AZURE_CHUNK_SIZE_MB=0.25" \
  minio/minio gateway azure
 ```
 
@@ -15,7 +14,6 @@ docker run -p 9000:9000 --name azure-s3 \
 ```
 export MINIO_ACCESS_KEY=azureaccountname
 export MINIO_SECRET_KEY=azureaccountkey
-export MINIO_AZURE_CHUNK_SIZE_MB=0.25
 minio gateway azure
 ```
 ## Test using MinIO Browser
@@ -27,7 +25,7 @@ MinIO Gateway comes with an embedded web based object browser. Point your web br
 
 ### Configure `mc`
 ```
-mc config host add myazure http://gateway-ip:9000 azureaccountname azureaccountkey
+mc alias set myazure http://gateway-ip:9000 azureaccountname azureaccountkey
 ```
 
 ### List containers on Microsoft Azure
@@ -37,6 +35,10 @@ mc ls myazure
 [2017-02-26 21:43:51 PST]     0B my-container/
 [2017-02-26 22:10:11 PST]     0B test-container1/
 ```
+
+### Use custom access/secret keys
+
+If you do not want to share the credentials of the Azure blob storage with your users/applications, you can set the original credentials in the shell environment using `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_KEY` variables and assign different access/secret keys to `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`.
 
 ### Known limitations
 Gateway inherits the following Azure limitations:

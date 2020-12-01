@@ -146,7 +146,7 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			expectedParsingErr:    nil,
 			expectedValidationErr: nil,
 		},
-		{ // lifecycle config with rules having overlapping prefix
+		{ // lifecycle config with rules having duplicate ID
 			inputConfig:           string(duplicateIDLcConfig),
 			expectedParsingErr:    nil,
 			expectedValidationErr: errLifecycleDuplicateID,
@@ -188,6 +188,12 @@ func TestMarshalLifecycleConfig(t *testing.T) {
 				Status:     "Enabled",
 				Filter:     Filter{Prefix: "prefix-1"},
 				Expiration: Expiration{Date: ExpirationDate(midnightTS)},
+			},
+			{
+				Status:                      "Enabled",
+				Filter:                      Filter{Prefix: "prefix-1"},
+				Expiration:                  Expiration{Date: ExpirationDate(midnightTS)},
+				NoncurrentVersionTransition: NoncurrentVersionTransition{NoncurrentDays: 2, StorageClass: "TEST"},
 			},
 		},
 	}
@@ -240,8 +246,8 @@ func TestExpectedExpiryTime(t *testing.T) {
 
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("Test %d", i+1), func(t *testing.T) {
-			got := expectedExpiryTime(tc.modTime, tc.days)
-			if got != tc.expected {
+			got := ExpectedExpiryTime(tc.modTime, int(tc.days))
+			if !got.Equal(tc.expected) {
 				t.Fatalf("Expected %v to be equal to %v", got, tc.expected)
 			}
 		})
@@ -281,6 +287,13 @@ func TestComputeActions(t *testing.T) {
 			objectName:     "foxdir/fooobject",
 			objectModTime:  time.Now().UTC().Add(-10 * 24 * time.Hour), // Created 10 days ago
 			expectedAction: NoneAction,
+		},
+		// Test rule with empty prefix e.g. for whole bucket
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			objectName:     "foxdir/fooobject/foo.txt",
+			objectModTime:  time.Now().UTC().Add(-10 * 24 * time.Hour), // Created 10 days ago
+			expectedAction: DeleteAction,
 		},
 		// Too early to remove (test Days)
 		{
@@ -359,6 +372,22 @@ func TestComputeActions(t *testing.T) {
 			objectModTime:  time.Now().UTC().Add(-24 * time.Hour), // Created 1 day ago
 			expectedAction: NoneAction,
 		},
+		// Should remove - empty prefix, tags match, date expiration kicked in
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><And><Tag><Key>tag1</Key><Value>value1</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Date>` + time.Now().Truncate(24*time.Hour).UTC().Add(-24*time.Hour).Format(time.RFC3339) + `</Date></Expiration></Rule></LifecycleConfiguration>`,
+			objectName:     "foxdir/fooobject",
+			objectTags:     "tag1=value1",
+			objectModTime:  time.Now().UTC().Add(-24 * time.Hour), // Created 1 day ago
+			expectedAction: DeleteAction,
+		},
+		// Should remove - empty prefix, tags match, object is expired based on specified Days
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><And><Prefix></Prefix><Tag><Key>tag1</Key><Value>value1</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`,
+			objectName:     "foxdir/fooobject",
+			objectTags:     "tag1=value1",
+			objectModTime:  time.Now().UTC().Add(-48 * time.Hour), // Created 2 day ago
+			expectedAction: DeleteAction,
+		},
 		// Should remove, the second rule has expiration kicked in
 		{
 			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Date>` + time.Now().Truncate(24*time.Hour).UTC().Add(24*time.Hour).Format(time.RFC3339) + `</Date></Expiration></Rule><Rule><Filter><Prefix>foxdir/</Prefix></Filter><Status>Enabled</Status><Expiration><Date>` + time.Now().Truncate(24*time.Hour).UTC().Add(-24*time.Hour).Format(time.RFC3339) + `</Date></Expiration></Rule></LifecycleConfiguration>`,
@@ -383,6 +412,64 @@ func TestComputeActions(t *testing.T) {
 			}); resultAction != tc.expectedAction {
 				t.Fatalf("Expected action: `%v`, got: `%v`", tc.expectedAction, resultAction)
 			}
+		})
+
+	}
+}
+
+func TestHasActiveRules(t *testing.T) {
+	testCases := []struct {
+		inputConfig    string
+		prefix         string
+		expectedNonRec bool
+		expectedRec    bool
+	}{
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix>foodir/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject",
+			expectedNonRec: true, expectedRec: true,
+		},
+		{ // empty prefix
+			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject/foo.txt",
+			expectedNonRec: true, expectedRec: true,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix>foodir/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "zdir/foobject",
+			expectedNonRec: false, expectedRec: false,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix>foodir/zdir/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/",
+			expectedNonRec: false, expectedRec: true,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix></Prefix></Filter><Status>Disabled</Status><Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/",
+			expectedNonRec: false, expectedRec: false,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Filter><Prefix>foodir/</Prefix></Filter><Status>Enabled</Status><Expiration><Date>2999-01-01T00:00:00.000Z</Date></Expiration></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject",
+			expectedNonRec: false, expectedRec: false,
+		},
+	}
+
+	for i, tc := range testCases {
+		tc := tc
+		t.Run(fmt.Sprintf("Test_%d", i+1), func(t *testing.T) {
+			lc, err := ParseLifecycleConfig(bytes.NewReader([]byte(tc.inputConfig)))
+			if err != nil {
+				t.Fatalf("Got unexpected error: %v", err)
+			}
+			if got := lc.HasActiveRules(tc.prefix, false); got != tc.expectedNonRec {
+				t.Fatalf("Expected result with recursive set to false: `%v`, got: `%v`", tc.expectedNonRec, got)
+			}
+			if got := lc.HasActiveRules(tc.prefix, true); got != tc.expectedRec {
+				t.Fatalf("Expected result with recursive set to true: `%v`, got: `%v`", tc.expectedRec, got)
+			}
+
 		})
 
 	}

@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"strings"
@@ -56,40 +57,29 @@ func isObjectDir(object string, size int64) bool {
 	return HasSuffix(object, SlashSeparator) && size == 0
 }
 
-// Converts just bucket, object metadata into ObjectInfo datatype.
-func dirObjectInfo(bucket, object string, size int64, metadata map[string]string) ObjectInfo {
-	// This is a special case with size as '0' and object ends with
-	// a slash separator, we treat it like a valid operation and
-	// return success.
-	etag := metadata["etag"]
-	delete(metadata, "etag")
-	if etag == "" {
-		etag = emptyETag
-	}
-
-	return ObjectInfo{
-		Bucket:      bucket,
-		Name:        object,
-		ModTime:     UTCNow(),
-		ContentType: "application/octet-stream",
-		IsDir:       true,
-		Size:        size,
-		ETag:        etag,
-		UserDefined: metadata,
-	}
-}
-
-// Depending on the disk type network or local, initialize storage API.
-func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
+func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err error) {
 	if endpoint.IsLocal {
-		storage, err := newXLStorage(endpoint.Path, endpoint.Host)
+		storage, err := newXLStorage(endpoint)
 		if err != nil {
 			return nil, err
 		}
 		return &xlStorageDiskIDCheck{storage: storage}, nil
 	}
 
-	return newStorageRESTClient(endpoint), nil
+	return newStorageRESTClient(endpoint, false), nil
+}
+
+// Depending on the disk type network or local, initialize storage API.
+func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
+	if endpoint.IsLocal {
+		storage, err := newXLStorage(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		return &xlStorageDiskIDCheck{storage: storage}, nil
+	}
+
+	return newStorageRESTClient(endpoint, true), nil
 }
 
 // Cleanup a directory recursively.
@@ -99,25 +89,43 @@ func cleanupDir(ctx context.Context, storage StorageAPI, volume, dirPath string)
 	delFunc = func(entryPath string) error {
 		if !HasSuffix(entryPath, SlashSeparator) {
 			// Delete the file entry.
-			err := storage.DeleteFile(volume, entryPath)
-			logger.LogIf(ctx, err)
+			err := storage.Delete(ctx, volume, entryPath, false)
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
 			return err
 		}
 
 		// If it's a directory, list and call delFunc() for each entry.
-		entries, err := storage.ListDir(volume, entryPath, -1)
-		// If entryPath prefix never existed, safe to ignore.
-		if err == errFileNotFound {
+		entries, err := storage.ListDir(ctx, volume, entryPath, -1)
+		// If entryPath prefix never existed, safe to ignore
+		if errors.Is(err, errFileNotFound) {
 			return nil
 		} else if err != nil { // For any other errors fail.
-			logger.LogIf(ctx, err)
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
 			return err
 		} // else on success..
 
 		// Entry path is empty, just delete it.
 		if len(entries) == 0 {
-			err = storage.DeleteFile(volume, entryPath)
-			logger.LogIf(ctx, err)
+			err = storage.Delete(ctx, volume, entryPath, false)
+			if !IsErrIgnored(err, []error{
+				errDiskNotFound,
+				errUnformattedDisk,
+				errFileNotFound,
+			}...) {
+				logger.LogIf(ctx, err)
+			}
 			return err
 		}
 
@@ -129,15 +137,22 @@ func cleanupDir(ctx context.Context, storage StorageAPI, volume, dirPath string)
 		}
 		return nil
 	}
+
 	err := delFunc(retainSlash(pathJoin(dirPath)))
+	if IsErrIgnored(err, []error{
+		errVolumeNotFound,
+		errVolumeAccessDenied,
+	}...) {
+		return nil
+	}
 	return err
 }
 
-func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	endWalkCh := make(chan struct{})
 	defer close(endWalkCh)
 	recursive := true
-	walkResultCh := startTreeWalk(ctx, bucket, prefix, "", recursive, listDir, endWalkCh)
+	walkResultCh := startTreeWalk(ctx, bucket, prefix, "", recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 
 	var objInfos []ObjectInfo
 	var eof bool
@@ -221,14 +236,14 @@ func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter 
 // to allocate a receive channel for ObjectInfo, upon any unhandled
 // error walker returns error. Optionally if context.Done() is received
 // then Walk() stops the walker.
-func fsWalk(ctx context.Context, obj ObjectLayer, bucket, prefix string, listDir ListDirFunc, results chan<- ObjectInfo, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) error {
+func fsWalk(ctx context.Context, obj ObjectLayer, bucket, prefix string, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, results chan<- ObjectInfo, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) error {
 	if err := checkListObjsArgs(ctx, bucket, prefix, "", obj); err != nil {
 		// Upon error close the channel.
 		close(results)
 		return err
 	}
 
-	walkResultCh := startTreeWalk(ctx, bucket, prefix, "", true, listDir, ctx.Done())
+	walkResultCh := startTreeWalk(ctx, bucket, prefix, "", true, listDir, isLeaf, isLeafDir, ctx.Done())
 
 	go func() {
 		defer close(results)
@@ -271,9 +286,9 @@ func fsWalk(ctx context.Context, obj ObjectLayer, bucket, prefix string, listDir
 	return nil
 }
 
-func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	if delimiter != SlashSeparator && delimiter != "" {
-		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, getObjInfo, getObjectInfoDirs...)
+		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, isLeaf, isLeafDir, getObjInfo, getObjectInfoDirs...)
 	}
 
 	if err := checkListObjsArgs(ctx, bucket, prefix, marker, obj); err != nil {
@@ -316,7 +331,7 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 	walkResultCh, endWalkCh := tpool.Release(listParams{bucket, recursive, marker, prefix})
 	if walkResultCh == nil {
 		endWalkCh = make(chan struct{})
-		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, endWalkCh)
+		walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
 	}
 
 	var objInfos []ObjectInfo

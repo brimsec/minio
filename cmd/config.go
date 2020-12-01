@@ -23,6 +23,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/config"
@@ -63,7 +64,7 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 				if err != nil {
 					return nil, err
 				}
-				if globalConfigEncrypted {
+				if globalConfigEncrypted && !utf8.Valid(data) {
 					data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 					if err != nil {
 						return nil, err
@@ -102,7 +103,7 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(data) {
 		data, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(data))
 	}
 
@@ -155,7 +156,7 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 		return nil, err
 	}
 
-	if globalConfigEncrypted {
+	if globalConfigEncrypted && !utf8.Valid(configData) {
 		configData, err = madmin.DecryptData(globalActiveCred.String(), bytes.NewReader(configData))
 		if err != nil {
 			if err == madmin.ErrMaliciousData {
@@ -214,20 +215,23 @@ func initConfig(objAPI ObjectLayer) error {
 	// ignore if the file doesn't exist.
 	// If etcd is set then migrates /config/config.json
 	// to '<export_path>/.minio.sys/config/config.json'
-	if err := migrateConfigToMinioSys(objAPI); err != nil {
+	freshConfig, err := migrateConfigToMinioSys(objAPI)
+	if err != nil {
 		return err
 	}
 
-	// Migrates backend '<export_path>/.minio.sys/config/config.json' to latest version.
-	if err := migrateMinioSysConfig(objAPI); err != nil {
-		return err
+	if !freshConfig {
+		// Migrates backend '<export_path>/.minio.sys/config/config.json' to latest version.
+		if err := migrateMinioSysConfig(objAPI); err != nil {
+			return err
+		}
+
+		// Migrates backend '<export_path>/.minio.sys/config/config.json' to
+		// latest config format.
+		if err := migrateMinioSysConfigToKV(objAPI); err != nil {
+			return err
+		}
 	}
 
-	// Migrates backend '<export_path>/.minio.sys/config/config.json' to
-	// latest config format.
-	if err := migrateMinioSysConfigToKV(objAPI); err != nil {
-		return err
-	}
-
-	return loadConfig(objAPI)
+	return loadConfig(objAPI, freshConfig)
 }

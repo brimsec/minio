@@ -65,8 +65,8 @@ type s3EncObjects struct {
 
 // ListObjects lists all blobs in S3 bucket filtered by prefix
 func (l *s3EncObjects) ListObjects(ctx context.Context, bucket string, prefix string, marker string, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, e error) {
-	var continuationToken, startAfter string
-	res, err := l.ListObjectsV2(ctx, bucket, prefix, continuationToken, delimiter, maxKeys, false, startAfter)
+	var startAfter string
+	res, err := l.ListObjectsV2(ctx, bucket, prefix, marker, delimiter, maxKeys, false, startAfter)
 	if err != nil {
 		return loi, err
 	}
@@ -91,10 +91,12 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 		if e != nil {
 			return loi, minio.ErrorRespToObjectError(e, bucket)
 		}
+
+		continuationToken = loi.NextContinuationToken
+		isTruncated = loi.IsTruncated
+
 		for _, obj := range loi.Objects {
 			startAfter = obj.Name
-			continuationToken = loi.NextContinuationToken
-			isTruncated = loi.IsTruncated
 
 			if !isGWObject(obj.Name) {
 				continue
@@ -316,7 +318,7 @@ func (l *s3EncObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 	}
 	fn, off, length, err := minio.NewGetObjectReader(rs, objInfo, o)
 	if err != nil {
-		return nil, minio.ErrorRespToObjectError(err)
+		return nil, minio.ErrorRespToObjectError(err, bucket, object)
 	}
 	if l.isGWEncrypted(ctx, bucket, object) {
 		object = getGWContentPath(object)
@@ -330,7 +332,7 @@ func (l *s3EncObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return fn(pr, h, o.CheckCopyPrecondFn, pipeCloser)
+	return fn(pr, h, o.CheckPrecondFn, pipeCloser)
 }
 
 // GetObjectInfo reads object info and replies back ObjectInfo
@@ -569,12 +571,12 @@ func (l *s3EncObjects) ListObjectParts(ctx context.Context, bucket string, objec
 }
 
 // AbortMultipartUpload aborts a ongoing multipart upload
-func (l *s3EncObjects) AbortMultipartUpload(ctx context.Context, bucket string, object string, uploadID string) error {
+func (l *s3EncObjects) AbortMultipartUpload(ctx context.Context, bucket string, object string, uploadID string, opts minio.ObjectOptions) error {
 	if _, err := l.getGWMetadata(ctx, bucket, getTmpDareMetaPath(object, uploadID)); err != nil {
-		return l.s3Objects.AbortMultipartUpload(ctx, bucket, object, uploadID)
+		return l.s3Objects.AbortMultipartUpload(ctx, bucket, object, uploadID, opts)
 	}
 
-	if err := l.s3Objects.AbortMultipartUpload(ctx, bucket, getGWContentPath(object), uploadID); err != nil {
+	if err := l.s3Objects.AbortMultipartUpload(ctx, bucket, getGWContentPath(object), uploadID, opts); err != nil {
 		return err
 	}
 
@@ -701,23 +703,22 @@ func (l *s3EncObjects) cleanupStaleEncMultipartUploads(ctx context.Context, clea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			l.cleanupStaleEncMultipartUploadsOnGW(ctx, expiry)
+			l.cleanupStaleUploads(ctx, expiry)
 		}
 	}
 }
 
-// cleanupStaleMultipartUploads removes old custom encryption multipart uploads on backend
-func (l *s3EncObjects) cleanupStaleEncMultipartUploadsOnGW(ctx context.Context, expiry time.Duration) {
-	for {
-		buckets, err := l.s3Objects.ListBuckets(ctx)
-		if err != nil {
-			break
-		}
-		for _, b := range buckets {
-			expParts := l.getStalePartsForBucket(ctx, b.Name, expiry)
-			for k := range expParts {
-				l.s3Objects.DeleteObject(ctx, b.Name, k, minio.ObjectOptions{})
-			}
+// cleanupStaleUploads removes old custom encryption multipart uploads on backend
+func (l *s3EncObjects) cleanupStaleUploads(ctx context.Context, expiry time.Duration) {
+	buckets, err := l.s3Objects.ListBuckets(ctx)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return
+	}
+	for _, b := range buckets {
+		expParts := l.getStalePartsForBucket(ctx, b.Name, expiry)
+		for k := range expParts {
+			l.s3Objects.DeleteObject(ctx, b.Name, k, minio.ObjectOptions{})
 		}
 	}
 }
@@ -729,6 +730,7 @@ func (l *s3EncObjects) getStalePartsForBucket(ctx context.Context, bucket string
 	for {
 		loi, err := l.s3Objects.ListObjectsV2(ctx, bucket, prefix, continuationToken, delimiter, 1000, false, startAfter)
 		if err != nil {
+			logger.LogIf(ctx, err)
 			break
 		}
 		for _, obj := range loi.Objects {

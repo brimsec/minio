@@ -23,9 +23,10 @@ import (
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	jsonrpc "github.com/gorilla/rpc/v2"
-	"github.com/gorilla/rpc/v2/json2"
 	"github.com/minio/minio/browser"
+	"github.com/minio/minio/cmd/logger"
+	jsonrpc "github.com/minio/minio/pkg/rpc"
+	"github.com/minio/minio/pkg/rpc/json2"
 )
 
 // webAPI container for Web API.
@@ -76,20 +77,34 @@ func registerWebRouter(router *mux.Router) error {
 	webRPC := jsonrpc.NewServer()
 	webRPC.RegisterCodec(codec, "application/json")
 	webRPC.RegisterCodec(codec, "application/json; charset=UTF-8")
+	webRPC.RegisterAfterFunc(func(ri *jsonrpc.RequestInfo) {
+		if ri != nil {
+			claims, _, _ := webRequestAuthenticate(ri.Request)
+			bucketName, objectName := extractBucketObject(ri.Args)
+			ri.Request = mux.SetURLVars(ri.Request, map[string]string{
+				"bucket": bucketName,
+				"object": objectName,
+			})
+			if globalHTTPTrace.HasSubscribers() {
+				globalHTTPTrace.Publish(WebTrace(ri))
+			}
+			logger.AuditLog(ri.ResponseWriter, ri.Request, ri.Method, claims.Map())
+		}
+	})
 
 	// Register RPC handlers with server
-	if err := webRPC.RegisterService(web, "Web"); err != nil {
+	if err := webRPC.RegisterService(web, "web"); err != nil {
 		return err
 	}
 
 	// RPC handler at URI - /minio/webrpc
-	webBrowserRouter.Methods("POST").Path("/webrpc").Handler(webRPC)
-	webBrowserRouter.Methods("PUT").Path("/upload/{bucket}/{object:.+}").HandlerFunc(httpTraceHdrs(web.Upload))
+	webBrowserRouter.Methods(http.MethodPost).Path("/webrpc").Handler(webRPC)
+	webBrowserRouter.Methods(http.MethodPut).Path("/upload/{bucket}/{object:.+}").HandlerFunc(httpTraceHdrs(web.Upload))
 
 	// These methods use short-expiry tokens in the URLs. These tokens may unintentionally
 	// be logged, so a new one must be generated for each request.
-	webBrowserRouter.Methods("GET").Path("/download/{bucket}/{object:.+}").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.Download))
-	webBrowserRouter.Methods("POST").Path("/zip").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.DownloadZip))
+	webBrowserRouter.Methods(http.MethodGet).Path("/download/{bucket}/{object:.+}").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.Download))
+	webBrowserRouter.Methods(http.MethodPost).Path("/zip").Queries("token", "{token:.*}").HandlerFunc(httpTraceHdrs(web.DownloadZip))
 
 	// Create compressed assets handler
 	compressAssets := handlers.CompressHandler(http.StripPrefix(minioReservedBucketPath, http.FileServer(assetFS())))

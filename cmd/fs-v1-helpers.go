@@ -41,9 +41,8 @@ func fsRemoveFile(ctx context.Context, filePath string) (err error) {
 		return err
 	}
 
-	if err = os.Remove((filePath)); err != nil {
-		err = osErrToFileErr(err)
-		if err != errFileNotFound {
+	if err = os.Remove(filePath); err != nil {
+		if err = osErrToFileErr(err); err != errFileNotFound {
 			logger.LogIf(ctx, err)
 		}
 	}
@@ -65,7 +64,7 @@ func fsRemoveAll(ctx context.Context, dirPath string) (err error) {
 	}
 
 	if err = removeAll(dirPath); err != nil {
-		if os.IsPermission(err) {
+		if osIsPermission(err) {
 			logger.LogIf(ctx, errVolumeAccessDenied)
 			return errVolumeAccessDenied
 		} else if isSysErrNotEmpty(err) {
@@ -93,7 +92,7 @@ func fsRemoveDir(ctx context.Context, dirPath string) (err error) {
 	}
 
 	if err = os.Remove((dirPath)); err != nil {
-		if os.IsNotExist(err) {
+		if osIsNotExist(err) {
 			return errVolumeNotFound
 		} else if isSysErrNotEmpty(err) {
 			return errVolumeNotEmpty
@@ -122,9 +121,9 @@ func fsMkdir(ctx context.Context, dirPath string) (err error) {
 
 	if err = os.Mkdir((dirPath), 0777); err != nil {
 		switch {
-		case os.IsExist(err):
+		case osIsExist(err):
 			return errVolumeExists
-		case os.IsPermission(err):
+		case osIsPermission(err):
 			logger.LogIf(ctx, errDiskAccessDenied)
 			return errDiskAccessDenied
 		case isSysErrNotDir(err):
@@ -171,9 +170,9 @@ func fsStat(ctx context.Context, statLoc string) (os.FileInfo, error) {
 func fsStatVolume(ctx context.Context, volume string) (os.FileInfo, error) {
 	fi, err := fsStat(ctx, volume)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if osIsNotExist(err) {
 			return nil, errVolumeNotFound
-		} else if os.IsPermission(err) {
+		} else if osIsPermission(err) {
 			return nil, errVolumeAccessDenied
 		}
 		return nil, err
@@ -256,7 +255,6 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 	// Verify if its not a regular file, since subsequent Seek is undefined.
 	if !st.Mode().IsRegular() {
-		logger.LogIf(ctx, errIsNotRegular)
 		return nil, 0, errIsNotRegular
 	}
 
@@ -286,12 +284,18 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, buf []
 	}
 
 	if err := mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
-		logger.LogIf(ctx, err)
-		return 0, err
-	}
-
-	if err := checkDiskFree(pathutil.Dir(filePath), fallocSize); err != nil {
-		logger.LogIf(ctx, err)
+		switch {
+		case osIsPermission(err):
+			return 0, errFileAccessDenied
+		case osIsExist(err):
+			return 0, errFileAccessDenied
+		case isSysErrIO(err):
+			return 0, errFaultyDisk
+		case isSysErrInvalidArg(err):
+			return 0, errUnsupportedDisk
+		case isSysErrNoSpace(err):
+			return 0, errDiskFull
+		}
 		return 0, err
 	}
 
