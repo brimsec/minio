@@ -93,7 +93,7 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 		_, err := uuid.Parse(vid)
 		if err != nil {
 			logger.LogIf(ctx, err)
-			return opts, VersionNotFound{
+			return opts, InvalidVersionID{
 				Bucket:    bucket,
 				Object:    object,
 				VersionID: vid,
@@ -123,6 +123,23 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 	}
 	opts.PartNumber = partNumber
 	opts.VersionID = vid
+	delMarker := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarker))
+	if delMarker != "" {
+		switch delMarker {
+		case "true":
+			opts.DeleteMarker = true
+		case "false":
+		default:
+			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarker, fmt.Errorf("DeleteMarker should be true or false"))
+			logger.LogIf(ctx, err)
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    err,
+			}
+		}
+
+	}
 	return opts, nil
 }
 
@@ -133,24 +150,41 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 		return opts, err
 	}
 	opts.Versioned = versioned
-	return opts, nil
-}
-
-// get ObjectOptions for PUT calls from encryption headers and metadata
-func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
-	versioned := globalBucketVersioningSys.Enabled(bucket)
-	vid := strings.TrimSpace(r.URL.Query().Get(xhttp.VersionID))
-	if vid != "" && vid != nullVersionID {
-		_, err := uuid.Parse(vid)
-		if err != nil {
+	opts.VersionSuspended = globalBucketVersioningSys.Suspended(bucket)
+	delMarker := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarker))
+	if delMarker != "" {
+		switch delMarker {
+		case "true":
+			opts.DeleteMarker = true
+		case "false":
+		default:
+			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarker, fmt.Errorf("DeleteMarker should be true or false"))
 			logger.LogIf(ctx, err)
-			return opts, VersionNotFound{
-				Bucket:    bucket,
-				Object:    object,
-				VersionID: vid,
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    err,
 			}
 		}
 	}
+
+	purgeVersion := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarkerDelete))
+	if purgeVersion != "" {
+		switch purgeVersion {
+		case "true":
+			opts.VersionPurgeStatus = Complete
+		case "false":
+		default:
+			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarkerDelete, fmt.Errorf("DeleteMarkerPurge should be true or false"))
+			logger.LogIf(ctx, err)
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    err,
+			}
+		}
+	}
+
 	mtime := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
 	if mtime != "" {
 		opts.MTime, err = time.Parse(time.RFC3339, mtime)
@@ -164,6 +198,50 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	} else {
 		opts.MTime = UTCNow()
 	}
+	return opts, nil
+}
+
+// get ObjectOptions for PUT calls from encryption headers and metadata
+func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
+	versioned := globalBucketVersioningSys.Enabled(bucket)
+	vid := strings.TrimSpace(r.URL.Query().Get(xhttp.VersionID))
+	if vid != "" && vid != nullVersionID {
+		_, err := uuid.Parse(vid)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return opts, InvalidVersionID{
+				Bucket:    bucket,
+				Object:    object,
+				VersionID: vid,
+			}
+		}
+		if !versioned {
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("VersionID specified %s, but versioning not enabled on  %s", opts.VersionID, bucket),
+			}
+		}
+	}
+	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
+	mtime := UTCNow()
+	if mtimeStr != "" {
+		mtime, err = time.Parse(time.RFC3339, mtimeStr)
+		if err != nil {
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceMTime, err),
+			}
+		}
+	}
+	etag := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceETag))
+	if etag != "" {
+		if metadata == nil {
+			metadata = make(map[string]string, 1)
+		}
+		metadata["etag"] = etag
+	}
 
 	// In the case of multipart custom format, the metadata needs to be checked in addition to header to see if it
 	// is SSE-S3 encrypted, primarily because S3 protocol does not require SSE-S3 headers in PutObjectPart calls
@@ -173,6 +251,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			UserDefined:          metadata,
 			VersionID:            vid,
 			Versioned:            versioned,
+			MTime:                mtime,
 		}, nil
 	}
 	if GlobalGatewaySSE.SSEC() && crypto.SSEC.IsRequested(r.Header) {
@@ -196,6 +275,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			UserDefined:          metadata,
 			VersionID:            vid,
 			Versioned:            versioned,
+			MTime:                mtime,
 		}, nil
 	}
 	// default case of passing encryption headers and UserDefined metadata to backend
@@ -205,6 +285,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	}
 	opts.VersionID = vid
 	opts.Versioned = versioned
+	opts.MTime = mtime
 	return opts, nil
 }
 

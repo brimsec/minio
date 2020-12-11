@@ -19,18 +19,22 @@ package rest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sync/atomic"
 	"time"
 
 	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
-// DefaultRESTTimeout - default RPC timeout is one minute.
-const DefaultRESTTimeout = 1 * time.Minute
+// DefaultTimeout - default REST timeout is 10 seconds.
+const DefaultTimeout = 10 * time.Second
 
 const (
 	offline = iota
@@ -73,11 +77,14 @@ type Client struct {
 	// Should only be modified before any calls are made.
 	MaxErrResponseSize int64
 
-	httpClient          *http.Client
-	httpIdleConnsCloser func()
-	url                 *url.URL
-	newAuthToken        func(audience string) string
-	connected           int32
+	// ExpectTimeouts indicates if context timeouts are expected.
+	// This will not mark the client offline in these cases.
+	ExpectTimeouts bool
+
+	httpClient   *http.Client
+	url          *url.URL
+	newAuthToken func(audience string) string
+	connected    int32
 }
 
 // URL query separator constants
@@ -85,26 +92,34 @@ const (
 	querySep = "?"
 )
 
-// CallWithContext - make a REST call with context.
-func (c *Client) CallWithContext(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
+type restError string
+
+func (e restError) Error() string {
+	return string(e)
+}
+
+func (e restError) Timeout() bool {
+	return true
+}
+
+// Call - make a REST call with context.
+func (c *Client) Call(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
 	if !c.IsOnline() {
-		return nil, &NetworkError{Err: errors.New("remote server offline")}
+		return nil, &NetworkError{Err: &url.Error{Op: method, URL: c.url.String(), Err: restError("remote server offline")}}
 	}
-	req, err := http.NewRequest(http.MethodPost, c.url.String()+method+querySep+values.Encode(), body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url.String()+method+querySep+values.Encode(), body)
 	if err != nil {
 		return nil, &NetworkError{err}
 	}
-	req = req.WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+c.newAuthToken(req.URL.Query().Encode()))
+	req.Header.Set("Authorization", "Bearer "+c.newAuthToken(req.URL.RawQuery))
 	req.Header.Set("X-Minio-Time", time.Now().UTC().Format(time.RFC3339))
 	if length > 0 {
 		req.ContentLength = length
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// A canceled context doesn't always mean a network problem.
-		if !errors.Is(err, context.Canceled) {
-			// We are safe from recursion
+		if c.HealthCheckFn != nil && xnet.IsNetworkOrHostDown(err, c.ExpectTimeouts) {
+			logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by %w", c.url.String(), err))
 			c.MarkOffline()
 		}
 		return nil, &NetworkError{err}
@@ -126,13 +141,18 @@ func (c *Client) CallWithContext(ctx context.Context, method string, values url.
 		// with the caller to take the client offline purpose
 		// fully it should make sure to respond with '412'
 		// instead, see cmd/storage-rest-server.go for ideas.
-		if resp.StatusCode == http.StatusPreconditionFailed {
+		if c.HealthCheckFn != nil && resp.StatusCode == http.StatusPreconditionFailed {
+			logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by PreconditionFailed with disk ID mismatch", c.url.String()))
 			c.MarkOffline()
 		}
 		defer xhttp.DrainBody(resp.Body)
 		// Limit the ReadAll(), just in case, because of a bug, the server responds with large data.
 		b, err := ioutil.ReadAll(io.LimitReader(resp.Body, c.MaxErrResponseSize))
 		if err != nil {
+			if c.HealthCheckFn != nil && xnet.IsNetworkOrHostDown(err, c.ExpectTimeouts) {
+				logger.LogIf(ctx, fmt.Errorf("Marking %s temporary offline; caused by %w", c.url.String(), err))
+				c.MarkOffline()
+			}
 			return nil, err
 		}
 		if len(b) > 0 {
@@ -143,32 +163,20 @@ func (c *Client) CallWithContext(ctx context.Context, method string, values url.
 	return resp.Body, nil
 }
 
-// Call - make a REST call.
-func (c *Client) Call(method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
-	ctx := context.Background()
-	return c.CallWithContext(ctx, method, values, body, length)
-}
-
 // Close closes all idle connections of the underlying http client
 func (c *Client) Close() {
 	atomic.StoreInt32(&c.connected, closed)
-	if c.httpIdleConnsCloser != nil {
-		c.httpIdleConnsCloser()
-	}
 }
 
 // NewClient - returns new REST client.
-func NewClient(url *url.URL, newCustomTransport func() *http.Transport, newAuthToken func(aud string) string) *Client {
+func NewClient(url *url.URL, tr http.RoundTripper, newAuthToken func(aud string) string) *Client {
 	// Transport is exactly same as Go default in https://golang.org/pkg/net/http/#RoundTripper
 	// except custom DialContext and TLSClientConfig.
-	tr := newCustomTransport()
 	return &Client{
 		httpClient:          &http.Client{Transport: tr},
-		httpIdleConnsCloser: tr.CloseIdleConnections,
 		url:                 url,
 		newAuthToken:        newAuthToken,
 		connected:           online,
-
 		MaxErrResponseSize:  4096,
 		HealthCheckInterval: 200 * time.Millisecond,
 		HealthCheckTimeout:  time.Second,
@@ -186,20 +194,18 @@ func (c *Client) MarkOffline() {
 	// Start goroutine that will attempt to reconnect.
 	// If server is already trying to reconnect this will have no effect.
 	if c.HealthCheckFn != nil && atomic.CompareAndSwapInt32(&c.connected, online, offline) {
-		if c.httpIdleConnsCloser != nil {
-			c.httpIdleConnsCloser()
-		}
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		go func() {
-			ticker := time.NewTicker(c.HealthCheckInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				if status := atomic.LoadInt32(&c.connected); status == closed {
+			for {
+				if atomic.LoadInt32(&c.connected) == closed {
 					return
 				}
 				if c.HealthCheckFn() {
 					atomic.CompareAndSwapInt32(&c.connected, offline, online)
+					logger.Info("Client %s online", c.url.String())
 					return
 				}
+				time.Sleep(time.Duration(r.Float64() * float64(c.HealthCheckInterval)))
 			}
 		}()
 	}

@@ -28,7 +28,7 @@ import (
 	humanize "github.com/dustin/go-humanize"
 )
 
-func (a badDisk) ReadFile(volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error) {
+func (a badDisk) ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error) {
 	return 0, errFaultyDisk
 }
 
@@ -203,8 +203,9 @@ func TestErasureDecode(t *testing.T) {
 // This test is t.Skip()ed as it a long time to run, hence should be run
 // explicitly after commenting out t.Skip()
 func TestErasureDecodeRandomOffsetLength(t *testing.T) {
-	// Comment the following line to run this test.
-	t.SkipNow()
+	if testing.Short() {
+		t.Skip()
+	}
 	// Initialize environment needed for the test.
 	dataBlocks := 7
 	parityBlocks := 7

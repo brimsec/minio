@@ -1,5 +1,5 @@
 /*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017 MinIO, Inc.
+ * MinIO Cloud Storage, (C) 2015-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,13 +39,13 @@ import (
 	"sync"
 	"time"
 
+	humanize "github.com/dustin/go-humanize"
+	"github.com/gorilla/mux"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/handlers"
 	"github.com/minio/minio/pkg/madmin"
-
-	humanize "github.com/dustin/go-humanize"
-	"github.com/gorilla/mux"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -93,7 +93,14 @@ func path2BucketObject(s string) (bucket, prefix string) {
 }
 
 func getDefaultParityBlocks(drive int) int {
-	return drive / 2
+	switch drive {
+	case 4, 5:
+		return 2
+	case 6, 7:
+		return 3
+	default:
+		return 4
+	}
 }
 
 func getDefaultDataBlocks(drive int) int {
@@ -105,7 +112,21 @@ func getReadQuorum(drive int) int {
 }
 
 func getWriteQuorum(drive int) int {
-	return getDefaultDataBlocks(drive) + 1
+	quorum := getDefaultDataBlocks(drive)
+	if getDefaultParityBlocks(drive) == quorum {
+		quorum++
+	}
+	return quorum
+}
+
+// cloneMSS will clone a map[string]string.
+// If input is nil an empty map is returned, not nil.
+func cloneMSS(v map[string]string) map[string]string {
+	r := make(map[string]string, len(v))
+	for k, v := range v {
+		r[k] = v
+	}
+	return r
 }
 
 // URI scheme constants.
@@ -170,7 +191,7 @@ const (
 	// (Acceptable values range from 1 to 10000 inclusive)
 	globalMaxPartID = 10000
 
-	// Default values used while communicating for internode communication.
+	// Default values used while communicating for gateway communication
 	defaultDialTimeout = 5 * time.Second
 )
 
@@ -449,15 +470,65 @@ func ToS3ETag(etag string) string {
 	return etag
 }
 
+func newInternodeHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
+	// For more details about various values used here refer
+	// https://golang.org/pkg/net/http/#Transport documentation
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 15 * time.Second,
+		TLSClientConfig:       tlsConfig,
+		// Go net/http automatically unzip if content-type is
+		// gzip disable this feature, as we are always interested
+		// in raw stream.
+		DisableCompression: true,
+	}
+
+	if tlsConfig != nil {
+		http2.ConfigureTransport(tr)
+	}
+
+	return func() *http.Transport {
+		return tr
+	}
+}
+
+// Used by only proxied requests, specifically only supports HTTP/1.1
+func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
+	// For more details about various values used here refer
+	// https://golang.org/pkg/net/http/#Transport documentation
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Minute, // Set larger timeouts for proxied requests.
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
+		TLSClientConfig:       tlsConfig,
+		// Go net/http automatically unzip if content-type is
+		// gzip disable this feature, as we are always interested
+		// in raw stream.
+		DisableCompression: true,
+	}
+
+	return func() *http.Transport {
+		return tr
+	}
+}
+
 func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) func() *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           xhttp.NewCustomDialContext(dialTimeout),
-		MaxIdleConnsPerHost:   16,
-		MaxIdleConns:          16,
-		IdleConnTimeout:       1 * time.Minute,
+		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
+		MaxIdleConnsPerHost:   1024,
+		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 10 * time.Second,
@@ -467,6 +538,11 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) fu
 		// in raw stream.
 		DisableCompression: true,
 	}
+
+	if tlsConfig != nil {
+		http2.ConfigureTransport(tr)
+	}
+
 	return func() *http.Transport {
 		return tr
 	}
@@ -485,11 +561,8 @@ func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
 		RootCAs: globalRootCAs,
 	}, defaultDialTimeout)()
 
-	// Allow more requests to be in flight.
+	// Customize response header timeout for gateway transport.
 	tr.ResponseHeaderTimeout = timeout
-	tr.MaxConnsPerHost = 256
-	tr.MaxIdleConnsPerHost = 16
-	tr.MaxIdleConns = 256
 	return tr
 }
 
@@ -690,4 +763,21 @@ func (t *timedValue) Invalidate() {
 	t.mu.Lock()
 	t.value = nil
 	t.mu.Unlock()
+}
+
+// On MinIO a directory object is stored as a regular object with "__XLDIR__" suffix.
+// For ex. "prefix/" is stored as "prefix__XLDIR__"
+func encodeDirObject(object string) string {
+	if HasSuffix(object, slashSeparator) {
+		return strings.TrimSuffix(object, slashSeparator) + globalDirSuffix
+	}
+	return object
+}
+
+// Reverse process of encodeDirObject()
+func decodeDirObject(object string) string {
+	if HasSuffix(object, globalDirSuffix) {
+		return strings.TrimSuffix(object, globalDirSuffix) + slashSeparator
+	}
+	return object
 }

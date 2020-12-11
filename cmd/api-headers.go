@@ -38,9 +38,18 @@ func mustGetRequestID(t time.Time) string {
 	return fmt.Sprintf("%X", t.UnixNano())
 }
 
+// setEventStreamHeaders to allow proxies to avoid buffering proxy responses
+func setEventStreamHeaders(w http.ResponseWriter) {
+	w.Header().Set(xhttp.ContentType, "text/event-stream")
+	w.Header().Set(xhttp.CacheControl, "no-cache") // nginx to turn off buffering
+	w.Header().Set("X-Accel-Buffering", "no")      // nginx to turn off buffering
+}
+
 // Write http common headers
 func setCommonHeaders(w http.ResponseWriter) {
-	w.Header().Set(xhttp.ServerInfo, "MinIO/"+ReleaseTag)
+	// Set the "Server" http header.
+	w.Header().Set(xhttp.ServerInfo, "MinIO")
+
 	// Set `x-amz-bucket-region` only if region is set on the server
 	// by default minio uses an empty region.
 	if region := globalServerRegion; region != "" {
@@ -77,7 +86,7 @@ func setPartsCountHeaders(w http.ResponseWriter, objInfo ObjectInfo) {
 }
 
 // Write object header
-func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSpec) (err error) {
+func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSpec, opts ObjectOptions) (err error) {
 	// set common headers
 	setCommonHeaders(w)
 
@@ -108,10 +117,11 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	}
 
 	// Set tag count if object has tags
-	tags, _ := url.ParseQuery(objInfo.UserTags)
-	tagCount := len(tags)
-	if tagCount > 0 {
-		w.Header()[xhttp.AmzTagCount] = []string{strconv.Itoa(tagCount)}
+	if len(objInfo.UserTags) > 0 {
+		tags, _ := url.ParseQuery(objInfo.UserTags)
+		if len(tags) > 0 {
+			w.Header()[xhttp.AmzTagCount] = []string{strconv.Itoa(len(tags))}
+		}
 	}
 
 	// Set all other user defined metadata.
@@ -119,6 +129,11 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			// values to client.
+			continue
+		}
+
+		// https://github.com/google/security-research/security/advisories/GHSA-76wf-9vgp-pj7w
+		if strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentLength) || strings.EqualFold(k, xhttp.AmzMetaUnencryptedContentMD5) {
 			continue
 		}
 		var isSet bool
@@ -135,15 +150,26 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 		}
 	}
 
+	var start, rangeLen int64
 	totalObjectSize, err := objInfo.GetActualSize()
 	if err != nil {
 		return err
 	}
 
-	// for providing ranged content
-	start, rangeLen, err := rs.GetOffsetLength(totalObjectSize)
-	if err != nil {
-		return err
+	if opts.PartNumber > 0 {
+		var start, end int64
+		for i := 0; i < len(objInfo.Parts) && i < opts.PartNumber; i++ {
+			start = end
+			end = start + objInfo.Parts[i].ActualSize - 1
+		}
+		rs = &HTTPRangeSpec{Start: start, End: end}
+		rangeLen = end - start + 1
+	} else {
+		// for providing ranged content
+		start, rangeLen, err = rs.GetOffsetLength(totalObjectSize)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Set content length.
@@ -157,7 +183,9 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	if objInfo.VersionID != "" {
 		w.Header()[xhttp.AmzVersionID] = []string{objInfo.VersionID}
 	}
-
+	if objInfo.ReplicationStatus.String() != "" {
+		w.Header()[xhttp.AmzBucketReplicationStatus] = []string{objInfo.ReplicationStatus.String()}
+	}
 	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil {
 		ruleID, expiryTime := lc.PredictExpiryTime(lifecycle.ObjectOpts{
 			Name:         objInfo.Name,
@@ -171,6 +199,9 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 			w.Header()[xhttp.AmzExpiration] = []string{
 				fmt.Sprintf(`expiry-date="%s", rule-id="%s"`, expiryTime.Format(http.TimeFormat), ruleID),
 			}
+		}
+		if objInfo.TransitionStatus == lifecycle.TransitionComplete {
+			w.Header()[xhttp.AmzStorageClass] = []string{objInfo.StorageClass}
 		}
 	}
 

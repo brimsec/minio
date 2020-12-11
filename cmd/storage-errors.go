@@ -16,16 +16,17 @@
 
 package cmd
 
-import "os"
-
 // errUnexpected - unexpected error, requires manual intervention.
-var errUnexpected = StorageErr("Unexpected error, please report this issue at https://github.com/minio/minio/issues")
+var errUnexpected = StorageErr("unexpected error, please report this issue at https://github.com/minio/minio/issues")
 
 // errCorruptedFormat - corrupted backend format.
-var errCorruptedFormat = StorageErr("corrupted backend format, please join https://slack.min.io for assistance")
+var errCorruptedFormat = StorageErr("corrupted backend format, specified disk mount has unexpected previous content")
 
 // errUnformattedDisk - unformatted disk found.
 var errUnformattedDisk = StorageErr("unformatted disk found")
+
+// errInconsistentDisk - inconsistent disk found.
+var errInconsistentDisk = StorageErr("inconsistent disk found")
 
 // errUnsupporteDisk - when disk does not support O_DIRECT flag.
 var errUnsupportedDisk = StorageErr("disk does not support O_DIRECT")
@@ -55,7 +56,7 @@ var errFileNotFound = StorageErr("file not found")
 var errFileVersionNotFound = StorageErr("file version not found")
 
 // errTooManyOpenFiles - too many open files.
-var errTooManyOpenFiles = StorageErr("too many open files")
+var errTooManyOpenFiles = StorageErr("too many open files, please increase 'ulimit -n'")
 
 // errFileNameTooLong - given file name is too long than supported length.
 var errFileNameTooLong = StorageErr("file name too long")
@@ -124,10 +125,10 @@ func osErrToFileErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	if os.IsNotExist(err) {
+	if osIsNotExist(err) {
 		return errFileNotFound
 	}
-	if os.IsPermission(err) {
+	if osIsPermission(err) {
 		return errFileAccessDenied
 	}
 	if isSysErrNotDir(err) {
@@ -141,6 +142,15 @@ func osErrToFileErr(err error) error {
 	}
 	if isSysErrHandleInvalid(err) {
 		return errFileNotFound
+	}
+	if isSysErrIO(err) {
+		return errFaultyDisk
+	}
+	if isSysErrInvalidArg(err) {
+		return errUnsupportedDisk
+	}
+	if isSysErrNoSpace(err) {
+		return errDiskFull
 	}
 	return err
 }

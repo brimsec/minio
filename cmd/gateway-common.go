@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -48,8 +49,8 @@ var (
 	// ListObjects function alias.
 	ListObjects = listObjects
 
-	// FilterMatchingPrefix function alias.
-	FilterMatchingPrefix = filterMatchingPrefix
+	// FilterListEntries function alias.
+	FilterListEntries = filterListEntries
 
 	// IsStringEqual is string equal.
 	IsStringEqual = isStringEqual
@@ -57,7 +58,7 @@ var (
 
 // FromMinioClientMetadata converts minio metadata to map[string]string
 func FromMinioClientMetadata(metadata map[string][]string) map[string]string {
-	mm := map[string]string{}
+	mm := make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		mm[http.CanonicalHeaderKey(k)] = v[0]
 	}
@@ -227,7 +228,7 @@ func ToMinioClientObjectInfoMetadata(metadata map[string]string) map[string][]st
 
 // ToMinioClientMetadata converts metadata to map[string]string
 func ToMinioClientMetadata(metadata map[string]string) map[string]string {
-	mm := make(map[string]string)
+	mm := make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		mm[http.CanonicalHeaderKey(k)] = v
 	}
@@ -254,25 +255,18 @@ func ToMinioClientCompleteParts(parts []CompletePart) []minio.CompletePart {
 // IsBackendOnline - verifies if the backend is reachable
 // by performing a GET request on the URL. returns 'true'
 // if backend is reachable.
-func IsBackendOnline(ctx context.Context, clnt *http.Client, urlStr string) bool {
+func IsBackendOnline(ctx context.Context, host string) bool {
+	var d net.Dialer
+
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	// never follow redirects
-	clnt.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	conn, err := d.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return false
 	}
-	resp, err := clnt.Do(req)
-	if err != nil {
-		clnt.CloseIdleConnections()
-		return !xnet.IsNetworkOrHostDown(err)
-	}
-	xhttp.DrainBody(resp.Body)
+
+	conn.Close()
 	return true
 }
 
@@ -291,7 +285,7 @@ func ErrorRespToObjectError(err error, params ...string) error {
 		object = params[1]
 	}
 
-	if xnet.IsNetworkOrHostDown(err) {
+	if xnet.IsNetworkOrHostDown(err, false) {
 		return BackendDown{}
 	}
 
@@ -349,16 +343,22 @@ func ComputeCompleteMultipartMD5(parts []CompletePart) string {
 // parse gateway sse env variable
 func parseGatewaySSE(s string) (gatewaySSE, error) {
 	l := strings.Split(s, ";")
-	var gwSlice = make([]string, 0)
+	var gwSlice gatewaySSE
 	for _, val := range l {
 		v := strings.ToUpper(val)
-		if v == gatewaySSES3 || v == gatewaySSEC {
+		switch v {
+		case "":
+			continue
+		case gatewaySSES3:
+			fallthrough
+		case gatewaySSEC:
 			gwSlice = append(gwSlice, v)
 			continue
+		default:
+			return nil, config.ErrInvalidGWSSEValue(nil).Msg("gateway SSE cannot be (%s) ", v)
 		}
-		return nil, config.ErrInvalidGWSSEValue(nil).Msg("gateway SSE cannot be (%s) ", v)
 	}
-	return gatewaySSE(gwSlice), nil
+	return gwSlice, nil
 }
 
 // handle gateway env vars
@@ -372,7 +372,7 @@ func gatewayHandleEnvVars() {
 	}
 
 	gwsseVal := env.Get("MINIO_GATEWAY_SSE", "")
-	if len(gwsseVal) != 0 {
+	if gwsseVal != "" {
 		var err error
 		GlobalGatewaySSE, err = parseGatewaySSE(gwsseVal)
 		if err != nil {

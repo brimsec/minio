@@ -62,7 +62,7 @@ func TestDataUsageUpdate(t *testing.T) {
 		return 0, nil
 	}
 
-	got, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, func() {}, getSize)
+	got, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestDataUsageUpdate(t *testing.T) {
 		},
 	}
 	createUsageTestFiles(t, base, bucket, files)
-	got, err = crawlDataFolder(context.Background(), base, got, func() {}, getSize)
+	got, err = crawlDataFolder(context.Background(), base, got, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,6 @@ func TestDataUsageUpdate(t *testing.T) {
 				t.Fatal("got nil result")
 			}
 			if w.flatten {
-				t.Log(e.Children)
 				*e = got.flatten(*e)
 			}
 			if e.Size != int64(w.size) {
@@ -269,7 +268,7 @@ func TestDataUsageUpdate(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = crawlDataFolder(context.Background(), base, got, func() {}, getSize)
+		got, err = crawlDataFolder(context.Background(), base, got, getSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -356,9 +355,16 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		}
 		return 0, nil
 	}
-	got, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, func() {}, getSize)
+	got, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got.root() == nil {
+		t.Log("cached folders:")
+		for folder := range got.Cache {
+			t.Log("folder:", folder)
+		}
+		t.Fatal("got nil root.")
 	}
 
 	// Test dirs
@@ -459,7 +465,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		},
 	}
 	createUsageTestFiles(t, base, "", files)
-	got, err = crawlDataFolder(context.Background(), base, got, func() {}, getSize)
+	got, err = crawlDataFolder(context.Background(), base, got, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +548,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = crawlDataFolder(context.Background(), base, got, func() {}, getSize)
+		got, err = crawlDataFolder(context.Background(), base, got, getSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -646,7 +652,7 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 		}
 		return 0, nil
 	}
-	want, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, func() {}, getSize)
+	want, err := crawlDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}

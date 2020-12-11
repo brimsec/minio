@@ -203,7 +203,7 @@ type Usage struct {
 // Vault - Fetches the Vault status
 type Vault struct {
 	Status  string `json:"status,omitempty"`
-	Encrypt string `json:"encryp,omitempty"`
+	Encrypt string `json:"encrypt,omitempty"`
 	Decrypt string `json:"decrypt,omitempty"`
 }
 
@@ -264,13 +264,15 @@ type ServerProperties struct {
 	Version  string            `json:"version,omitempty"`
 	CommitID string            `json:"commitID,omitempty"`
 	Network  map[string]string `json:"network,omitempty"`
-	Disks    []Disk            `json:"disks,omitempty"`
+	Disks    []Disk            `json:"drives,omitempty"`
 }
 
 // Disk holds Disk information
 type Disk struct {
 	Endpoint        string  `json:"endpoint,omitempty"`
+	RootDisk        bool    `json:"rootDisk,omitempty"`
 	DrivePath       string  `json:"path,omitempty"`
+	Healing         bool    `json:"healing,omitempty"`
 	State           string  `json:"state,omitempty"`
 	UUID            string  `json:"uuid,omitempty"`
 	Model           string  `json:"model,omitempty"`

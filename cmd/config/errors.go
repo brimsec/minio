@@ -102,6 +102,12 @@ var (
 		"MINIO_CACHE_RANGE: Valid expected value is `on` or `off`",
 	)
 
+	ErrInvalidCacheCommitValue = newErrFn(
+		"Invalid cache commit value",
+		"Please check the passed value",
+		"MINIO_CACHE_COMMIT: Valid expected value is `writeback` or `writethrough`",
+	)
+
 	ErrInvalidRotatingCredentialsBackendEncrypted = newErrFn(
 		"Invalid rotating credentials",
 		"Please set correct rotating credentials in the environment for decryption",
@@ -187,12 +193,6 @@ Example 1:
 		"",
 	)
 
-	ErrCorruptedBackend = newErrFn(
-		"Unable to use the specified backend, pre-existing content detected",
-		"Please ensure your disk mount does not have any pre-existing content",
-		"",
-	)
-
 	ErrUnableToWriteInBackend = newErrFn(
 		"Unable to write to the backend",
 		"Please ensure MinIO binary has write permissions for the backend",
@@ -209,12 +209,6 @@ Example 1:
 		"Unable to use specified port",
 		"Please ensure MinIO binary has 'cap_net_bind_service=+ep' permissions",
 		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
-	)
-
-	ErrNoPermissionsToAccessDirFiles = newErrFn(
-		"Missing permissions to access the specified path",
-		"Please ensure the specified path can be accessed",
-		"",
 	)
 
 	ErrSSLUnexpectedError = newErrFn(
@@ -250,12 +244,6 @@ Example 1:
 	ErrSSLWrongPassword = newErrFn(
 		"Unable to decrypt the private key using the provided password",
 		"Please set the correct password in environment variable `MINIO_CERT_PASSWD`",
-		"",
-	)
-
-	ErrUnexpectedDataContent = newErrFn(
-		"Unexpected data content",
-		"Please contact MinIO at https://slack.min.io",
 		"",
 	)
 

@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"errors"
 
+	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 )
 
@@ -38,6 +39,8 @@ func IsMultiPart(metadata map[string]string) bool {
 func RemoveSensitiveEntries(metadata map[string]string) { // The functions is tested in TestRemoveSensitiveHeaders for compatibility reasons
 	delete(metadata, SSECKey)
 	delete(metadata, SSECopyKey)
+	delete(metadata, xhttp.AmzMetaUnencryptedContentLength)
+	delete(metadata, xhttp.AmzMetaUnencryptedContentMD5)
 }
 
 // RemoveSSEHeaders removes all crypto-specific SSE
@@ -60,6 +63,17 @@ func RemoveInternalEntries(metadata map[string]string) {
 	delete(metadata, S3SealedKey)
 	delete(metadata, S3KMSKeyID)
 	delete(metadata, S3KMSSealedKey)
+}
+
+// IsSourceEncrypted returns true if the source is encrypted
+func IsSourceEncrypted(metadata map[string]string) bool {
+	if _, ok := metadata[SSECAlgorithm]; ok {
+		return true
+	}
+	if _, ok := metadata[SSEHeader]; ok {
+		return true
+	}
+	return false
 }
 
 // IsEncrypted returns true if the object metadata indicates
@@ -115,7 +129,7 @@ func (ssec) IsEncrypted(metadata map[string]string) bool {
 // metadata is nil.
 func CreateMultipartMetadata(metadata map[string]string) map[string]string {
 	if metadata == nil {
-		metadata = map[string]string{}
+		return map[string]string{SSEMultipart: ""}
 	}
 	metadata[SSEMultipart] = ""
 	return metadata
@@ -142,7 +156,7 @@ func (s3) CreateMetadata(metadata map[string]string, keyID string, kmsKey []byte
 	}
 
 	if metadata == nil {
-		metadata = map[string]string{}
+		metadata = make(map[string]string, 5)
 	}
 
 	metadata[SSESealAlgorithm] = sealedKey.Algorithm
@@ -190,15 +204,17 @@ func (s3) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []byte
 	}
 
 	// Check whether all extracted values are well-formed
-	iv, err := base64.StdEncoding.DecodeString(b64IV)
-	if err != nil || len(iv) != 32 {
+	var iv [32]byte
+	n, err := base64.StdEncoding.Decode(iv[:], []byte(b64IV))
+	if err != nil || n != 32 {
 		return keyID, kmsKey, sealedKey, errInvalidInternalIV
 	}
 	if algorithm != SealAlgorithm {
 		return keyID, kmsKey, sealedKey, errInvalidInternalSealAlgorithm
 	}
-	encryptedKey, err := base64.StdEncoding.DecodeString(b64SealedKey)
-	if err != nil || len(encryptedKey) != 64 {
+	var encryptedKey [64]byte
+	n, err = base64.StdEncoding.Decode(encryptedKey[:], []byte(b64SealedKey))
+	if err != nil || n != 64 {
 		return keyID, kmsKey, sealedKey, Errorf("The internal sealed key for SSE-S3 is invalid")
 	}
 	if idPresent && kmsKeyPresent { // We are using a KMS -> parse the sealed KMS data key.
@@ -209,8 +225,8 @@ func (s3) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []byte
 	}
 
 	sealedKey.Algorithm = algorithm
-	copy(sealedKey.IV[:], iv)
-	copy(sealedKey.Key[:], encryptedKey)
+	sealedKey.IV = iv
+	sealedKey.Key = encryptedKey
 	return keyID, kmsKey, sealedKey, nil
 }
 
@@ -222,7 +238,7 @@ func (ssec) CreateMetadata(metadata map[string]string, sealedKey SealedKey) map[
 	}
 
 	if metadata == nil {
-		metadata = map[string]string{}
+		metadata = make(map[string]string, 3)
 	}
 	metadata[SSESealAlgorithm] = SealAlgorithm
 	metadata[SSEIV] = base64.StdEncoding.EncodeToString(sealedKey.IV[:])

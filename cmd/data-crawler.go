@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math/rand"
 	"os"
 	"path"
 	"strconv"
@@ -28,12 +29,15 @@ import (
 	"time"
 
 	"github.com/minio/minio/cmd/config"
+	"github.com/minio/minio/cmd/config/heal"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bucket/lifecycle"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"github.com/minio/minio/pkg/color"
 	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/madmin"
 	"github.com/willf/bloom"
 )
 
@@ -43,6 +47,14 @@ const (
 	dataCrawlStartDelay      = 5 * time.Minute  // Time to wait on startup and between cycles.
 	dataUsageUpdateDirCycles = 16               // Visit all folders every n cycles.
 
+	healDeleteDangling    = true
+	healFolderIncludeProb = 32  // Include a clean folder one in n cycles.
+	healObjectSelectProb  = 512 // Overall probability of a file being scanned; one in n.
+)
+
+var (
+	globalHealConfig             heal.Config
+	dataCrawlerLeaderLockTimeout = newDynamicTimeout(30*time.Second, 10*time.Second)
 )
 
 // initDataCrawler will start the crawler unless disabled.
@@ -56,6 +68,19 @@ func initDataCrawler(ctx context.Context, objAPI ObjectLayer) {
 // The function will block until the context is canceled.
 // There should only ever be one crawler running per cluster.
 func runDataCrawler(ctx context.Context, objAPI ObjectLayer) {
+	// Make sure only 1 crawler is running on the cluster.
+	locker := objAPI.NewNSLock(minioMetaBucket, "runDataCrawler.lock")
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for {
+		err := locker.GetLock(ctx, dataCrawlerLeaderLockTimeout)
+		if err != nil {
+			time.Sleep(time.Duration(r.Float64() * float64(dataCrawlStartDelay)))
+			continue
+		}
+		break
+		// No unlock for "leader" lock.
+	}
+
 	// Load current bloom cycle
 	nextBloomCycle := intDataUpdateTracker.current() + 1
 	var buf bytes.Buffer
@@ -86,12 +111,6 @@ func runDataCrawler(ctx context.Context, objAPI ObjectLayer) {
 			if err == nil {
 				// Store new cycle...
 				nextBloomCycle++
-				if nextBloomCycle%dataUpdateTrackerResetEvery == 0 {
-					if intDataUpdateTracker.debug {
-						logger.Info(color.Green("runDataCrawler:") + " Resetting bloom filter for next runs.")
-					}
-					nextBloomCycle++
-				}
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], nextBloomCycle)
 				r, err := hash.NewReader(bytes.NewReader(tmp[:]), int64(len(tmp)), "", "", int64(len(tmp)), false)
@@ -110,20 +129,22 @@ func runDataCrawler(ctx context.Context, objAPI ObjectLayer) {
 }
 
 type cachedFolder struct {
-	name   string
-	parent *dataUsageHash
+	name              string
+	parent            *dataUsageHash
+	objectHealProbDiv uint32
 }
 
 type folderScanner struct {
-	root               string
-	getSize            getSizeFn
-	oldCache           dataUsageCache
-	newCache           dataUsageCache
-	withFilter         *bloomFilter
-	waitForLowActiveIO func()
+	root       string
+	getSize    getSizeFn
+	oldCache   dataUsageCache
+	newCache   dataUsageCache
+	withFilter *bloomFilter
 
 	dataUsageCrawlMult  float64
 	dataUsageCrawlDebug bool
+	healFolderInclude   uint32 // Include a clean folder one in n cycles.
+	healObjectSelect    uint32 // Do a heal check on an object once every n cycles. Must divide into healFolderInclude
 
 	newFolders      []cachedFolder
 	existingFolders []cachedFolder
@@ -133,7 +154,7 @@ type folderScanner struct {
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation waitForLowActiveIO is called which can be used to temporarily halt the crawler.
 // If the supplied context is canceled the function will return at the first chance.
-func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache, waitForLowActiveIO func(), getSize getSizeFn) (dataUsageCache, error) {
+func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache, getSize getSizeFn) (dataUsageCache, error) {
 	t := UTCNow()
 
 	logPrefix := color.Green("data-usage: ")
@@ -161,13 +182,21 @@ func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache,
 		getSize:             getSize,
 		oldCache:            cache,
 		newCache:            dataUsageCache{Info: cache.Info},
-		waitForLowActiveIO:  waitForLowActiveIO,
 		newFolders:          nil,
 		existingFolders:     nil,
 		dataUsageCrawlMult:  delayMult,
 		dataUsageCrawlDebug: intDataUpdateTracker.debug,
+		healFolderInclude:   0,
+		healObjectSelect:    0,
 	}
 
+	// Enable healing in XL mode.
+	if globalIsErasure {
+		// Include a clean folder one in n cycles.
+		s.healFolderInclude = healFolderIncludeProb
+		// Do a heal check on an object once every n cycles. Must divide into healFolderInclude
+		s.healObjectSelect = healObjectSelectProb
+	}
 	if len(cache.Info.BloomFilter) > 0 {
 		s.withFilter = &bloomFilter{BloomFilter: &bloom.BloomFilter{}}
 		_, err := s.withFilter.ReadFrom(bytes.NewBuffer(cache.Info.BloomFilter))
@@ -188,7 +217,7 @@ func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache,
 	}
 
 	// Always scan flattenLevels deep. Cache root is level 0.
-	todo := []cachedFolder{{name: cache.Info.Name}}
+	todo := []cachedFolder{{name: cache.Info.Name, objectHealProbDiv: 1}}
 	for i := 0; i < flattenLevels; i++ {
 		if s.dataUsageCrawlDebug {
 			logger.Info(logPrefix+"Level %v, scanning %v directories."+logSuffix, i, len(todo))
@@ -217,7 +246,7 @@ func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache,
 			return s.newCache, ctx.Err()
 		default:
 		}
-		du, err := s.deepScanFolder(ctx, folder.name)
+		du, err := s.deepScanFolder(ctx, folder)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
@@ -248,26 +277,38 @@ func crawlDataFolder(ctx context.Context, basePath string, cache dataUsageCache,
 		}
 		h := hashPath(folder.name)
 		if !h.mod(s.oldCache.Info.NextCycle, dataUsageUpdateDirCycles) {
-			s.newCache.replaceHashed(h, folder.parent, s.oldCache.Cache[h.Key()])
-			continue
+			if !h.mod(s.oldCache.Info.NextCycle, s.healFolderInclude/folder.objectHealProbDiv) {
+				s.newCache.replaceHashed(h, folder.parent, s.oldCache.Cache[h.Key()])
+				continue
+			} else {
+				folder.objectHealProbDiv = s.healFolderInclude
+			}
+			folder.objectHealProbDiv = dataUsageUpdateDirCycles
 		}
-
 		if s.withFilter != nil {
 			_, prefix := path2BucketObjectWithBasePath(basePath, folder.name)
 			if s.oldCache.Info.lifeCycle == nil || !s.oldCache.Info.lifeCycle.HasActiveRules(prefix, true) {
 				// If folder isn't in filter, skip it completely.
 				if !s.withFilter.containsDir(folder.name) {
-					if s.dataUsageCrawlDebug {
-						logger.Info(logPrefix+"Skipping non-updated folder: %v"+logSuffix, folder)
+					if !h.mod(s.oldCache.Info.NextCycle, s.healFolderInclude/folder.objectHealProbDiv) {
+						if s.dataUsageCrawlDebug {
+							logger.Info(logPrefix+"Skipping non-updated folder: %v"+logSuffix, folder)
+						}
+						s.newCache.replaceHashed(h, folder.parent, s.oldCache.Cache[h.Key()])
+						continue
+					} else {
+						if s.dataUsageCrawlDebug {
+							logger.Info(logPrefix+"Adding non-updated folder to heal check: %v"+logSuffix, folder.name)
+						}
+						// Update probability of including objects
+						folder.objectHealProbDiv = s.healFolderInclude
 					}
-					s.newCache.replaceHashed(h, folder.parent, s.oldCache.Cache[h.Key()])
-					continue
 				}
 			}
 		}
 
 		// Update on this cycle...
-		du, err := s.deepScanFolder(ctx, folder.name)
+		du, err := s.deepScanFolder(ctx, folder)
 		if err != nil {
 			logger.LogIf(ctx, err)
 			continue
@@ -300,32 +341,39 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 		default:
 		}
 		thisHash := hashPath(folder.name)
+		existing := f.oldCache.findChildrenCopy(thisHash)
 
 		// If there are lifecycle rules for the prefix, remove the filter.
 		filter := f.withFilter
 		var activeLifeCycle *lifecycle.Lifecycle
-		if f.oldCache.Info.lifeCycle != nil && filter != nil {
+		if f.oldCache.Info.lifeCycle != nil {
 			_, prefix := path2BucketObjectWithBasePath(f.root, folder.name)
 			if f.oldCache.Info.lifeCycle.HasActiveRules(prefix, true) {
 				if f.dataUsageCrawlDebug {
-					logger.Info(color.Green("data-usage:")+" Prefix %q has active rules", prefix)
+					logger.Info(color.Green("folder-scanner:")+" Prefix %q has active rules", prefix)
 				}
 				activeLifeCycle = f.oldCache.Info.lifeCycle
 				filter = nil
 			}
 		}
-
 		if _, ok := f.oldCache.Cache[thisHash.Key()]; filter != nil && ok {
 			// If folder isn't in filter and we have data, skip it completely.
 			if folder.name != dataUsageRoot && !filter.containsDir(folder.name) {
-				f.newCache.copyWithChildren(&f.oldCache, thisHash, folder.parent)
-				if f.dataUsageCrawlDebug {
-					logger.Info(color.Green("data-usage:")+" Skipping non-updated folder: %v", folder.name)
+				if !thisHash.mod(f.oldCache.Info.NextCycle, f.healFolderInclude/folder.objectHealProbDiv) {
+					f.newCache.copyWithChildren(&f.oldCache, thisHash, folder.parent)
+					if f.dataUsageCrawlDebug {
+						logger.Info(color.Green("folder-scanner:")+" Skipping non-updated folder: %v", folder.name)
+					}
+					continue
+				} else {
+					if f.dataUsageCrawlDebug {
+						logger.Info(color.Green("folder-scanner:")+" Adding non-updated folder to heal check: %v", folder.name)
+					}
+					// If probability was already crawlerHealFolderInclude, keep it.
+					folder.objectHealProbDiv = f.healFolderInclude
 				}
-				continue
 			}
 		}
-		f.waitForLowActiveIO()
 		sleepDuration(dataCrawlSleepPerFolder, f.dataUsageCrawlMult)
 
 		cache := dataUsageEntry{}
@@ -336,14 +384,14 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 			bucket, prefix := path2BucketObjectWithBasePath(f.root, entName)
 			if bucket == "" {
 				if f.dataUsageCrawlDebug {
-					logger.Info(color.Green("data-usage:")+" no bucket (%s,%s)", f.root, entName)
+					logger.Info(color.Green("folder-scanner:")+" no bucket (%s,%s)", f.root, entName)
 				}
 				return nil
 			}
 
 			if isReservedOrInvalidBucket(bucket, false) {
 				if f.dataUsageCrawlDebug {
-					logger.Info(color.Green("data-usage:")+" invalid bucket: %v, entry: %v", bucket, entName)
+					logger.Info(color.Green("folder-scanner:")+" invalid bucket: %v, entry: %v", bucket, entName)
 				}
 				return nil
 			}
@@ -359,7 +407,8 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 				_, exists := f.oldCache.Cache[h.Key()]
 				cache.addChildString(entName)
 
-				this := cachedFolder{name: entName, parent: &thisHash}
+				this := cachedFolder{name: entName, parent: &thisHash, objectHealProbDiv: folder.objectHealProbDiv}
+				delete(existing, h.Key())
 				cache.addChild(h)
 				if final {
 					if exists {
@@ -372,7 +421,7 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 				}
 				return nil
 			}
-			f.waitForLowActiveIO()
+
 			// Dynamic time delay.
 			t := UTCNow()
 
@@ -385,11 +434,12 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 				objectName: path.Base(entName),
 				debug:      f.dataUsageCrawlDebug,
 				lifeCycle:  activeLifeCycle,
+				heal:       thisHash.mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv),
 			}
 			size, err := f.getSize(item)
 
 			sleepDuration(time.Since(t), f.dataUsageCrawlMult)
-			if err == errSkipFile || err == errFileNotFound {
+			if err == errSkipFile {
 				return nil
 			}
 			logger.LogIf(ctx, err)
@@ -402,19 +452,88 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 		if err != nil {
 			return nil, err
 		}
+
+		if f.healObjectSelect == 0 {
+			// If we are not scanning, return now.
+			f.newCache.replaceHashed(thisHash, folder.parent, cache)
+			continue
+		}
+
+		objAPI := newObjectLayerFn()
+		if objAPI == nil {
+			continue
+		}
+
+		bgSeq, found := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
+		if !found {
+			continue
+		}
+
+		// Whatever remains in 'existing' are folders at this level
+		// that existed in the previous run but wasn't found now.
+		//
+		// This may be because of 2 reasons:
+		//
+		// 1) The folder/object was deleted.
+		// 2) We come from another disk and this disk missed the write.
+		//
+		// We therefore perform a heal check.
+		// If that doesn't bring it back we remove the folder and assume it was deleted.
+		// This means that the next run will not look for it.
+		for k := range existing {
+			bucket, prefix := path2BucketObject(k)
+			if f.dataUsageCrawlDebug {
+				logger.Info(color.Green("folder-scanner:")+" checking disappeared folder: %v/%v", bucket, prefix)
+			}
+
+			// Dynamic time delay.
+			t := UTCNow()
+
+			err = objAPI.HealObjects(ctx, bucket, prefix, madmin.HealOpts{Recursive: true, Remove: healDeleteDangling},
+				func(bucket, object, versionID string) error {
+					// Wait for each heal as per crawler frequency.
+					sleepDuration(time.Since(t), f.dataUsageCrawlMult)
+
+					defer func() {
+						t = UTCNow()
+					}()
+					return bgSeq.queueHealTask(healSource{
+						bucket:    bucket,
+						object:    object,
+						versionID: versionID,
+					}, madmin.HealItemObject)
+				})
+
+			sleepDuration(time.Since(t), f.dataUsageCrawlMult)
+
+			if f.dataUsageCrawlDebug && err != nil {
+				logger.Info(color.Green("healObjects:")+" checking returned value %v", err)
+			}
+
+			// Add unless healing returned an error.
+			if err == nil {
+				this := cachedFolder{name: k, parent: &thisHash, objectHealProbDiv: folder.objectHealProbDiv}
+				cache.addChild(hashPath(k))
+				if final {
+					f.existingFolders = append(f.existingFolders, this)
+				} else {
+					nextFolders = append(nextFolders, this)
+				}
+			}
+		}
 		f.newCache.replaceHashed(thisHash, folder.parent, cache)
 	}
 	return nextFolders, nil
 }
 
 // deepScanFolder will deep scan a folder and return the size if no error occurs.
-func (f *folderScanner) deepScanFolder(ctx context.Context, folder string) (*dataUsageEntry, error) {
+func (f *folderScanner) deepScanFolder(ctx context.Context, folder cachedFolder) (*dataUsageEntry, error) {
 	var cache dataUsageEntry
 
 	done := ctx.Done()
 
 	var addDir func(entName string, typ os.FileMode) error
-	var dirStack = []string{f.root, folder}
+	var dirStack = []string{f.root, folder.name}
 
 	addDir = func(entName string, typ os.FileMode) error {
 		select {
@@ -423,7 +542,6 @@ func (f *folderScanner) deepScanFolder(ctx context.Context, folder string) (*dat
 		default:
 		}
 
-		f.waitForLowActiveIO()
 		if typ&os.ModeDir != 0 {
 			dirStack = append(dirStack, entName)
 			err := readDirFn(path.Join(dirStack...), addDir)
@@ -445,7 +563,7 @@ func (f *folderScanner) deepScanFolder(ctx context.Context, folder string) (*dat
 		if f.oldCache.Info.lifeCycle != nil {
 			if f.oldCache.Info.lifeCycle.HasActiveRules(prefix, false) {
 				if f.dataUsageCrawlDebug {
-					logger.Info(color.Green("data-usage:")+" Prefix %q has active rules", prefix)
+					logger.Info(color.Green("folder-scanner:")+" Prefix %q has active rules", prefix)
 				}
 				activeLifeCycle = f.oldCache.Info.lifeCycle
 			}
@@ -460,6 +578,7 @@ func (f *folderScanner) deepScanFolder(ctx context.Context, folder string) (*dat
 				objectName: path.Base(entName),
 				debug:      f.dataUsageCrawlDebug,
 				lifeCycle:  activeLifeCycle,
+				heal:       hashPath(path.Join(prefix, entName)).mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv),
 			})
 
 		// Don't sleep for really small amount of time
@@ -490,6 +609,7 @@ type crawlItem struct {
 	prefix     string // Only the prefix if any, does not have final object name.
 	objectName string // Only the object name without prefixes.
 	lifeCycle  *lifecycle.Lifecycle
+	heal       bool // Has the object been selected for heal check?
 	debug      bool
 }
 
@@ -509,9 +629,9 @@ func (i *crawlItem) transformMetaDir() {
 
 // actionMeta contains information used to apply actions.
 type actionMeta struct {
-	oi          ObjectInfo
-	trustOI     bool // Set true if oi can be trusted and has been read with quorum.
-	numVersions int  // The number of versions of this object
+	oi               ObjectInfo
+	successorModTime time.Time // The modtime of the successor version
+	numVersions      int       // The number of versions of this object
 }
 
 // applyActions will apply lifecycle checks on to a scanned item.
@@ -523,6 +643,20 @@ func (i *crawlItem) applyActions(ctx context.Context, o ObjectLayer, meta action
 	if i.debug {
 		logger.LogIf(ctx, err)
 	}
+	if i.heal {
+		if i.debug {
+			logger.Info(color.Green("applyActions:")+" heal checking: %v/%v v%s", i.bucket, i.objectPath(), meta.oi.VersionID)
+		}
+		res, err := o.HealObject(ctx, i.bucket, i.objectPath(), meta.oi.VersionID, madmin.HealOpts{Remove: healDeleteDangling})
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			return 0
+		}
+		if err != nil && !errors.Is(err, NotImplemented{}) {
+			logger.LogIf(ctx, err)
+			return 0
+		}
+		size = res.ObjectSize
+	}
 	if i.lifeCycle == nil {
 		return size
 	}
@@ -530,90 +664,135 @@ func (i *crawlItem) applyActions(ctx context.Context, o ObjectLayer, meta action
 	versionID := meta.oi.VersionID
 	action := i.lifeCycle.ComputeAction(
 		lifecycle.ObjectOpts{
-			Name:         i.objectPath(),
-			UserTags:     meta.oi.UserTags,
-			ModTime:      meta.oi.ModTime,
-			VersionID:    meta.oi.VersionID,
-			DeleteMarker: meta.oi.DeleteMarker,
-			IsLatest:     meta.oi.IsLatest,
-			NumVersions:  meta.numVersions,
+			Name:             i.objectPath(),
+			UserTags:         meta.oi.UserTags,
+			ModTime:          meta.oi.ModTime,
+			VersionID:        meta.oi.VersionID,
+			DeleteMarker:     meta.oi.DeleteMarker,
+			IsLatest:         meta.oi.IsLatest,
+			NumVersions:      meta.numVersions,
+			SuccessorModTime: meta.successorModTime,
+			RestoreOngoing:   meta.oi.RestoreOngoing,
+			RestoreExpires:   meta.oi.RestoreExpires,
+			TransitionStatus: meta.oi.TransitionStatus,
 		})
 	if i.debug {
-		logger.Info(color.Green("applyActions:")+" lifecycle: %q, Initial scan: %v", i.objectPath(), action)
+		logger.Info(color.Green("applyActions:")+" lifecycle: %q (version-id=%s), Initial scan: %v", i.objectPath(), versionID, action)
 	}
 	switch action {
 	case lifecycle.DeleteAction, lifecycle.DeleteVersionAction:
+	case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+	case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
 	default:
 		// No action.
 		return size
 	}
 
-	// These (expensive) operations should only run on items we are likely to delete.
-	// Load to ensure that we have the correct version and not an unsynced version.
-	if !meta.trustOI {
-		obj, err := o.GetObjectInfo(ctx, i.bucket, i.objectPath(), ObjectOptions{
-			VersionID: versionID,
-		})
-		if err != nil {
-			switch err.(type) {
-			case MethodNotAllowed: // This happens usually for a delete marker
-				if !obj.DeleteMarker { // if this is not a delete marker log and return
-					// Do nothing - heal in the future.
-					logger.LogIf(ctx, err)
-					return size
-				}
-			case ObjectNotFound:
-				// object not found return 0
-				return 0
-			default:
-				// All other errors proceed.
+	obj, err := o.GetObjectInfo(ctx, i.bucket, i.objectPath(), ObjectOptions{
+		VersionID: versionID,
+	})
+	if err != nil {
+		switch err.(type) {
+		case MethodNotAllowed: // This happens usually for a delete marker
+			if !obj.DeleteMarker { // if this is not a delete marker log and return
+				// Do nothing - heal in the future.
 				logger.LogIf(ctx, err)
 				return size
 			}
-		}
-		size = obj.Size
-
-		// Recalculate action.
-		action = i.lifeCycle.ComputeAction(
-			lifecycle.ObjectOpts{
-				Name:         i.objectPath(),
-				UserTags:     obj.UserTags,
-				ModTime:      obj.ModTime,
-				VersionID:    obj.VersionID,
-				DeleteMarker: obj.DeleteMarker,
-				IsLatest:     obj.IsLatest,
-				NumVersions:  meta.numVersions,
-			})
-		if i.debug {
-			logger.Info(color.Green("applyActions:")+" lifecycle: Secondary scan: %v", action)
-		}
-		versionID = obj.VersionID
-		switch action {
-		case lifecycle.DeleteAction, lifecycle.DeleteVersionAction:
+		case ObjectNotFound:
+			// object not found return 0
+			return 0
 		default:
-			// No action.
+			// All other errors proceed.
+			logger.LogIf(ctx, err)
 			return size
 		}
+	}
+	size = obj.Size
+
+	// Recalculate action.
+	lcOpts := lifecycle.ObjectOpts{
+		Name:             i.objectPath(),
+		UserTags:         obj.UserTags,
+		ModTime:          obj.ModTime,
+		VersionID:        obj.VersionID,
+		DeleteMarker:     obj.DeleteMarker,
+		IsLatest:         obj.IsLatest,
+		NumVersions:      meta.numVersions,
+		SuccessorModTime: meta.successorModTime,
+		RestoreOngoing:   obj.RestoreOngoing,
+		RestoreExpires:   obj.RestoreExpires,
+		TransitionStatus: obj.TransitionStatus,
+	}
+	action = i.lifeCycle.ComputeAction(lcOpts)
+
+	if i.debug {
+		logger.Info(color.Green("applyActions:")+" lifecycle: Secondary scan: %v", action)
+	}
+	switch action {
+	case lifecycle.DeleteAction, lifecycle.DeleteVersionAction:
+	case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+	case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
+	default:
+		// No action.
+		return size
 	}
 
 	opts := ObjectOptions{}
 	switch action {
-	case lifecycle.DeleteVersionAction:
-		opts.VersionID = versionID
-	case lifecycle.DeleteAction:
+	case lifecycle.DeleteVersionAction, lifecycle.DeleteRestoredVersionAction:
+		// Defensive code, should never happen
+		if obj.VersionID == "" {
+			return size
+		}
+		if rcfg, _ := globalBucketObjectLockSys.Get(i.bucket); rcfg.LockEnabled {
+			locked := enforceRetentionForDeletion(ctx, obj)
+			if locked {
+				if i.debug {
+					logger.Info(color.Green("applyActions:")+" lifecycle: %s is locked, not deleting", i.objectPath())
+				}
+				return size
+			}
+		}
+		opts.VersionID = obj.VersionID
+	case lifecycle.DeleteAction, lifecycle.DeleteRestoredAction:
 		opts.Versioned = globalBucketVersioningSys.Enabled(i.bucket)
+	case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+		if obj.TransitionStatus == "" {
+			opts.Versioned = globalBucketVersioningSys.Enabled(obj.Bucket)
+			opts.VersionID = obj.VersionID
+			opts.TransitionStatus = lifecycle.TransitionPending
+			if _, err = o.DeleteObject(ctx, obj.Bucket, obj.Name, opts); err != nil {
+				// Assume it is still there.
+				logger.LogIf(ctx, err)
+				return size
+			}
+		}
+		globalTransitionState.queueTransitionTask(obj)
+		return 0
+	}
+	if obj.TransitionStatus != "" {
+		if err := deleteTransitionedObject(ctx, o, i.bucket, i.objectPath(), lcOpts, action, false); err != nil {
+			logger.LogIf(ctx, err)
+			return size
+		}
+	} else {
+		obj, err = o.DeleteObject(ctx, i.bucket, i.objectPath(), opts)
+		if err != nil {
+			// Assume it is still there.
+			logger.LogIf(ctx, err)
+			return size
+		}
 	}
 
-	obj, err := o.DeleteObject(ctx, i.bucket, i.objectPath(), opts)
-	if err != nil {
-		// Assume it is still there.
-		logger.LogIf(ctx, err)
-		return size
+	eventName := event.ObjectRemovedDelete
+	if obj.DeleteMarker {
+		eventName = event.ObjectRemovedDeleteMarkerCreated
 	}
 
 	// Notify object deleted event.
 	sendEvent(eventArgs{
-		EventName:  event.ObjectRemovedDelete,
+		EventName:  eventName,
 		BucketName: i.bucket,
 		Object:     obj,
 		Host:       "Internal: [ILM-EXPIRY]",
@@ -626,14 +805,60 @@ func (i *crawlItem) objectPath() string {
 	return path.Join(i.prefix, i.objectName)
 }
 
-// sleepDuration multiplies the duration d by x and sleeps if is more than 100 micro seconds.
-// sleep is limited to max 1 second.
+// sleepDuration multiplies the duration d by x
+// and sleeps if is more than 100 micro seconds.
+// Sleep is limited to max 15 seconds.
 func sleepDuration(d time.Duration, x float64) {
+	const maxWait = 15 * time.Second
+	const minWait = 100 * time.Microsecond
 	// Don't sleep for really small amount of time
-	if d := time.Duration(float64(d) * x); d > time.Microsecond*100 {
-		if d > time.Second {
-			d = time.Second
+	if d := time.Duration(float64(d) * x); d > minWait {
+		if d > maxWait {
+			d = maxWait
 		}
 		time.Sleep(d)
+	}
+}
+
+// healReplication will heal a scanned item that has failed replication.
+func (i *crawlItem) healReplication(ctx context.Context, o ObjectLayer, meta actionMeta) {
+	if meta.oi.DeleteMarker || !meta.oi.VersionPurgeStatus.Empty() {
+		//heal delete marker replication failure or versioned delete replication failure
+		if meta.oi.ReplicationStatus == replication.Pending ||
+			meta.oi.ReplicationStatus == replication.Failed ||
+			meta.oi.VersionPurgeStatus == Failed || meta.oi.VersionPurgeStatus == Pending {
+			i.healReplicationDeletes(ctx, o, meta)
+			return
+		}
+	}
+	if meta.oi.ReplicationStatus == replication.Pending ||
+		meta.oi.ReplicationStatus == replication.Failed {
+		globalReplicationState.queueReplicaTask(meta.oi)
+	}
+}
+
+// healReplicationDeletes will heal a scanned deleted item that failed to replicate deletes.
+func (i *crawlItem) healReplicationDeletes(ctx context.Context, o ObjectLayer, meta actionMeta) {
+	// handle soft delete and permanent delete failures here.
+	if meta.oi.DeleteMarker || !meta.oi.VersionPurgeStatus.Empty() {
+		versionID := ""
+		dmVersionID := ""
+		if meta.oi.VersionPurgeStatus.Empty() {
+			dmVersionID = meta.oi.VersionID
+		} else {
+			versionID = meta.oi.VersionID
+		}
+		globalReplicationState.queueReplicaDeleteTask(DeletedObjectVersionInfo{
+			DeletedObject: DeletedObject{
+				ObjectName:                    meta.oi.Name,
+				DeleteMarkerVersionID:         dmVersionID,
+				VersionID:                     versionID,
+				DeleteMarkerReplicationStatus: string(meta.oi.ReplicationStatus),
+				DeleteMarkerMTime:             DeleteMarkerMTime{meta.oi.ModTime},
+				DeleteMarker:                  meta.oi.DeleteMarker,
+				VersionPurgeStatus:            meta.oi.VersionPurgeStatus,
+			},
+			Bucket: meta.oi.Bucket,
+		})
 	}
 }

@@ -47,8 +47,10 @@ const (
 	KMSKeyStatusAdminAction = "admin:KMSKeyStatus"
 	// ServerInfoAdminAction - allow listing server info
 	ServerInfoAdminAction = "admin:ServerInfo"
-	// OBDInfoAdminAction - allow obtaining cluster on-board diagnostics
-	OBDInfoAdminAction = "admin:OBDInfo"
+	// HealthInfoAdminAction - allow obtaining cluster health information
+	HealthInfoAdminAction = "admin:OBDInfo"
+	// BandwidthMonitorAction - allow monitoring bandwidth usage
+	BandwidthMonitorAction = "admin:BandwidthMonitor"
 
 	// ServerUpdateAdminAction - allow MinIO binary update
 	ServerUpdateAdminAction = "admin:ServerUpdate"
@@ -108,6 +110,13 @@ const (
 	// GetBucketQuotaAdminAction - allow getting bucket quota
 	GetBucketQuotaAdminAction = "admin:GetBucketQuota"
 
+	// Bucket Target admin Actions
+
+	// SetBucketTargetAction - allow setting bucket target
+	SetBucketTargetAction = "admin:SetBucketTarget"
+	// GetBucketTargetAction - allow getting bucket targets
+	GetBucketTargetAction = "admin:GetBucketTarget"
+
 	// AllAdminActions - provides all admin permissions
 	AllAdminActions = "admin:*"
 )
@@ -123,7 +132,8 @@ var supportedAdminActions = map[AdminAction]struct{}{
 	ConsoleLogAdminAction:          {},
 	KMSKeyStatusAdminAction:        {},
 	ServerInfoAdminAction:          {},
-	OBDInfoAdminAction:             {},
+	HealthInfoAdminAction:          {},
+	BandwidthMonitorAction:         {},
 	ServerUpdateAdminAction:        {},
 	ServiceRestartAdminAction:      {},
 	ServiceStopAdminAction:         {},
@@ -147,6 +157,8 @@ var supportedAdminActions = map[AdminAction]struct{}{
 	ListUserPoliciesAdminAction:    {},
 	SetBucketQuotaAdminAction:      {},
 	GetBucketQuotaAdminAction:      {},
+	SetBucketTargetAction:          {},
+	GetBucketTargetAction:          {},
 	AllAdminActions:                {},
 }
 
@@ -163,7 +175,8 @@ var adminActionConditionKeyMap = map[Action]condition.KeySet{
 	StorageInfoAdminAction:         condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	ServerInfoAdminAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	DataUsageInfoAdminAction:       condition.NewKeySet(condition.AllSupportedAdminKeys...),
-	OBDInfoAdminAction:             condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	HealthInfoAdminAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	BandwidthMonitorAction:         condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	TopLocksAdminAction:            condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	ProfilingAdminAction:           condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	TraceAdminAction:               condition.NewKeySet(condition.AllSupportedAdminKeys...),
@@ -191,4 +204,6 @@ var adminActionConditionKeyMap = map[Action]condition.KeySet{
 	ListUserPoliciesAdminAction:    condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	SetBucketQuotaAdminAction:      condition.NewKeySet(condition.AllSupportedAdminKeys...),
 	GetBucketQuotaAdminAction:      condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	SetBucketTargetAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
+	GetBucketTargetAction:          condition.NewKeySet(condition.AllSupportedAdminKeys...),
 }

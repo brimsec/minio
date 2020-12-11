@@ -28,8 +28,8 @@ import (
 	"github.com/minio/minio/pkg/madmin"
 )
 
-// CheckCopyPreconditionFn returns true if copy precondition check failed.
-type CheckCopyPreconditionFn func(o ObjectInfo, encETag string) bool
+// CheckPreconditionFn returns true if precondition check failed.
+type CheckPreconditionFn func(o ObjectInfo) bool
 
 // GetObjectInfoFn is the signature of GetObjectInfo function.
 type GetObjectInfoFn func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error)
@@ -37,13 +37,20 @@ type GetObjectInfoFn func(ctx context.Context, bucket, object string, opts Objec
 // ObjectOptions represents object options for ObjectLayer object operations
 type ObjectOptions struct {
 	ServerSideEncryption encrypt.ServerSide
-	Versioned            bool                    // indicates if the bucket is versioned
-	WalkVersions         bool                    // indicates if the we are interested in walking versions
-	VersionID            string                  // Specifies the versionID which needs to be overwritten or read
-	MTime                time.Time               // Is only set in POST/PUT operations
-	UserDefined          map[string]string       // only set in case of POST/PUT operations
-	PartNumber           int                     // only useful in case of GetObject/HeadObject
-	CheckCopyPrecondFn   CheckCopyPreconditionFn // only set during CopyObject preconditional valuation
+	VersionSuspended     bool      // indicates if the bucket was previously versioned but is currently suspended.
+	Versioned            bool      // indicates if the bucket is versioned
+	WalkVersions         bool      // indicates if the we are interested in walking versions
+	VersionID            string    // Specifies the versionID which needs to be overwritten or read
+	MTime                time.Time // Is only set in POST/PUT operations
+	Expires              time.Time // Is only used in POST/PUT operations
+
+	DeleteMarker                  bool                   // Is only set in DELETE operations for delete marker replication
+	UserDefined                   map[string]string      // only set in case of POST/PUT operations
+	PartNumber                    int                    // only useful in case of GetObject/HeadObject
+	CheckPrecondFn                CheckPreconditionFn    // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
+	DeleteMarkerReplicationStatus string                 // Is only set in DELETE operations
+	VersionPurgeStatus            VersionPurgeStatusType // Is only set in DELETE operations for delete marker version to be permanently deleted.
+	TransitionStatus              string                 // status of the transition
 }
 
 // BucketOptions represents bucket options for ObjectLayer bucket operations
@@ -64,8 +71,10 @@ const (
 
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
+	SetDriveCount() int // Only implemented by erasure layer
+
 	// Locking operations on object.
-	NewNSLock(ctx context.Context, bucket string, objects ...string) RWLocker
+	NewNSLock(bucket string, objects ...string) RWLocker
 
 	// Storage operations.
 	Shutdown(context.Context) error
@@ -107,11 +116,10 @@ type ObjectLayer interface {
 	PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error)
 	GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) (info MultipartInfo, err error)
 	ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (result ListPartsInfo, err error)
-	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error
+	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
 
 	// Healing operations.
-	ReloadFormat(ctx context.Context, dryRun bool) error
 	HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error)
 	HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (madmin.HealResultItem, error)
 	HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error)
@@ -125,7 +133,7 @@ type ObjectLayer interface {
 
 	// Supported operations check
 	IsNotificationSupported() bool
-	IsListenBucketSupported() bool
+	IsListenSupported() bool
 	IsEncryptionSupported() bool
 	IsTaggingSupported() bool
 	IsCompressionSupported() bool
@@ -133,8 +141,8 @@ type ObjectLayer interface {
 	// Backend related metrics
 	GetMetrics(ctx context.Context) (*Metrics, error)
 
-	// Check Readiness
-	IsReady(ctx context.Context) bool
+	// Returns health of the backend
+	Health(ctx context.Context, opts HealthOptions) HealthResult
 
 	// ObjectTagging operations
 	PutObjectTags(context.Context, string, string, string, ObjectOptions) error

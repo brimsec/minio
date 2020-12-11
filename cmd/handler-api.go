@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/minio/minio/cmd/config/api"
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/sys"
 )
 
 type apiConfig struct {
@@ -29,45 +31,76 @@ type apiConfig struct {
 
 	requestsDeadline time.Duration
 	requestsPool     chan struct{}
-	readyDeadline    time.Duration
+	clusterDeadline  time.Duration
+	listQuorum       int
+	extendListLife   time.Duration
 	corsAllowOrigins []string
 }
 
-func (t *apiConfig) init(cfg api.Config) {
+func (t *apiConfig) init(cfg api.Config, setDriveCount int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.readyDeadline = cfg.APIReadyDeadline
-	t.corsAllowOrigins = cfg.APICorsAllowOrigin
-	if cfg.APIRequestsMax <= 0 {
-		return
+	t.clusterDeadline = cfg.ClusterDeadline
+	t.corsAllowOrigins = cfg.CorsAllowOrigin
+
+	var apiRequestsMaxPerNode int
+	if cfg.RequestsMax <= 0 {
+		stats, err := sys.GetStats()
+		if err != nil {
+			logger.LogIf(GlobalContext, err)
+			// Default to 16 GiB, not critical.
+			stats.TotalRAM = 16 << 30
+		}
+		// max requests per node is calculated as
+		// total_ram / ram_per_request
+		// ram_per_request is 4MiB * setDriveCount + 2 * 10MiB (default erasure block size)
+		apiRequestsMaxPerNode = int(stats.TotalRAM / uint64(setDriveCount*readBlockSize+blockSizeV1*2))
+	} else {
+		apiRequestsMaxPerNode = cfg.RequestsMax
+		if len(globalEndpoints.Hostnames()) > 0 {
+			apiRequestsMaxPerNode /= len(globalEndpoints.Hostnames())
+		}
 	}
 
-	apiRequestsMax := cfg.APIRequestsMax
-	if len(globalEndpoints.Hosts()) > 0 {
-		apiRequestsMax /= len(globalEndpoints.Hosts())
-	}
+	t.requestsPool = make(chan struct{}, apiRequestsMaxPerNode)
+	t.requestsDeadline = cfg.RequestsDeadline
+	t.listQuorum = cfg.GetListQuorum()
+	t.extendListLife = cfg.ExtendListLife
+}
 
-	t.requestsPool = make(chan struct{}, apiRequestsMax)
-	t.requestsDeadline = cfg.APIRequestsDeadline
+func (t *apiConfig) getListQuorum() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.listQuorum
+}
+
+func (t *apiConfig) getExtendListLife() time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.extendListLife
 }
 
 func (t *apiConfig) getCorsAllowOrigins() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	return t.corsAllowOrigins
+	corsAllowOrigins := make([]string, len(t.corsAllowOrigins))
+	copy(corsAllowOrigins, t.corsAllowOrigins)
+	return corsAllowOrigins
 }
 
-func (t *apiConfig) getReadyDeadline() time.Duration {
+func (t *apiConfig) getClusterDeadline() time.Duration {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.readyDeadline == 0 {
+	if t.clusterDeadline == 0 {
 		return 10 * time.Second
 	}
 
-	return t.readyDeadline
+	return t.clusterDeadline
 }
 
 func (t *apiConfig) getRequestsPool() (chan struct{}, <-chan time.Time) {
@@ -76,6 +109,9 @@ func (t *apiConfig) getRequestsPool() (chan struct{}, <-chan time.Time) {
 
 	if t.requestsPool == nil {
 		return nil, nil
+	}
+	if t.requestsDeadline <= 0 {
+		return t.requestsPool, nil
 	}
 
 	return t.requestsPool, time.NewTimer(t.requestsDeadline).C

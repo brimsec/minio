@@ -189,7 +189,7 @@ func testStorageInfoWebHandler(obj ObjectLayer, instanceType string, t TestErrHa
 
 	storageInfoRequest := &WebGenericArgs{}
 	storageInfoReply := &StorageInfoRep{}
-	req, err := newTestWebRPCRequest("Web.StorageInfo", authorization, storageInfoRequest)
+	req, err := newTestWebRPCRequest("web.StorageInfo", authorization, storageInfoRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -222,7 +222,7 @@ func testServerInfoWebHandler(obj ObjectLayer, instanceType string, t TestErrHan
 
 	serverInfoRequest := &WebGenericArgs{}
 	serverInfoReply := &ServerInfoRep{}
-	req, err := newTestWebRPCRequest("Web.ServerInfo", authorization, serverInfoRequest)
+	req, err := newTestWebRPCRequest("web.ServerInfo", authorization, serverInfoRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -279,7 +279,7 @@ func testMakeBucketWebHandler(obj ObjectLayer, instanceType string, t TestErrHan
 	for i, testCase := range testCases {
 		makeBucketRequest := MakeBucketArgs{BucketName: testCase.bucketName}
 		makeBucketReply := &WebGenericRep{}
-		req, err := newTestWebRPCRequest("Web.MakeBucket", authorization, makeBucketRequest)
+		req, err := newTestWebRPCRequest("web.MakeBucket", authorization, makeBucketRequest)
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request: <ERROR> %v", i+1, err)
 		}
@@ -366,7 +366,7 @@ func testDeleteBucketWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 		makeBucketRequest := MakeBucketArgs{BucketName: test.bucketName}
 		makeBucketReply := &WebGenericRep{}
 
-		req, err := newTestWebRPCRequest("Web.DeleteBucket", test.token, makeBucketRequest)
+		req, err := newTestWebRPCRequest("web.DeleteBucket", test.token, makeBucketRequest)
 		if err != nil {
 			t.Errorf("failed to create HTTP request: <ERROR> %v", err)
 		}
@@ -439,7 +439,7 @@ func testListBucketsWebHandler(obj ObjectLayer, instanceType string, t TestErrHa
 
 	listBucketsRequest := WebGenericArgs{}
 	listBucketsReply := &ListBucketsRep{}
-	req, err := newTestWebRPCRequest("Web.ListBuckets", authorization, listBucketsRequest)
+	req, err := newTestWebRPCRequest("web.ListBuckets", authorization, listBucketsRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -500,7 +500,7 @@ func testListObjectsWebHandler(obj ObjectLayer, instanceType string, t TestErrHa
 		listObjectsRequest := ListObjectsArgs{BucketName: bucketName, Prefix: ""}
 		listObjectsReply := &ListObjectsRep{}
 		var req *http.Request
-		req, err = newTestWebRPCRequest("Web.ListObjects", token, listObjectsRequest)
+		req, err = newTestWebRPCRequest("web.ListObjects", token, listObjectsRequest)
 		if err != nil {
 			return nil, err
 		}
@@ -584,7 +584,7 @@ func testRemoveObjectWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 
 	removeRequest := RemoveObjectArgs{BucketName: bucketName, Objects: []string{"a/", "object"}}
 	removeReply := &WebGenericRep{}
-	req, err := newTestWebRPCRequest("Web.RemoveObject", authorization, removeRequest)
+	req, err := newTestWebRPCRequest("web.RemoveObject", authorization, removeRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -599,7 +599,7 @@ func testRemoveObjectWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 
 	removeRequest = RemoveObjectArgs{BucketName: bucketName, Objects: []string{"a/", "object"}}
 	removeReply = &WebGenericRep{}
-	req, err = newTestWebRPCRequest("Web.RemoveObject", authorization, removeRequest)
+	req, err = newTestWebRPCRequest("web.RemoveObject", authorization, removeRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -614,7 +614,7 @@ func testRemoveObjectWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 
 	removeRequest = RemoveObjectArgs{BucketName: bucketName}
 	removeReply = &WebGenericRep{}
-	req, err = newTestWebRPCRequest("Web.RemoveObject", authorization, removeRequest)
+	req, err = newTestWebRPCRequest("web.RemoveObject", authorization, removeRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -650,7 +650,7 @@ func testGenerateAuthWebHandler(obj ObjectLayer, instanceType string, t TestErrH
 
 	generateAuthRequest := WebGenericArgs{}
 	generateAuthReply := &GenerateAuthReply{}
-	req, err := newTestWebRPCRequest("Web.GenerateAuth", authorization, generateAuthRequest)
+	req, err := newTestWebRPCRequest("web.GenerateAuth", authorization, generateAuthRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -692,7 +692,7 @@ func testCreateURLToken(obj ObjectLayer, instanceType string, t TestErrHandler) 
 	args := WebGenericArgs{}
 	tokenReply := &URLTokenReply{}
 
-	req, err := newTestWebRPCRequest("Web.CreateURLToken", authorization, args)
+	req, err := newTestWebRPCRequest("web.CreateURLToken", authorization, args)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +752,7 @@ func testUploadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandler
 
 	test := func(token string, sendContentLength bool) int {
 		rec := httptest.NewRecorder()
-		req, rErr := http.NewRequest("PUT", "/minio/upload/"+bucketName+SlashSeparator+objectName, nil)
+		req, rErr := http.NewRequest(http.MethodPut, "/minio/upload/"+bucketName+SlashSeparator+objectName, nil)
 		if rErr != nil {
 			t.Fatalf("Cannot create upload request, %v", rErr)
 		}
@@ -838,7 +838,7 @@ func testDownloadWebHandler(obj ObjectLayer, instanceType string, t TestErrHandl
 			path = path + token
 		}
 		var req *http.Request
-		req, err = http.NewRequest("GET", path, nil)
+		req, err = http.NewRequest(http.MethodGet, path, nil)
 
 		if err != nil {
 			t.Fatalf("Cannot create upload request, %v", err)
@@ -935,9 +935,16 @@ func testWebHandlerDownloadZip(obj ObjectLayer, instanceType string, t TestErrHa
 		t.Fatalf("%s : %s", instanceType, err)
 	}
 
-	obj.PutObject(context.Background(), bucket, "a/one", mustGetPutObjReader(t, strings.NewReader(fileOne), int64(len(fileOne)), "", ""), opts)
-	obj.PutObject(context.Background(), bucket, "a/b/two", mustGetPutObjReader(t, strings.NewReader(fileTwo), int64(len(fileTwo)), "", ""), opts)
-	obj.PutObject(context.Background(), bucket, "a/c/three", mustGetPutObjReader(t, strings.NewReader(fileThree), int64(len(fileThree)), "", ""), opts)
+	for objName, value := range map[string]string{
+		"a/one":     fileOne,
+		"a/b/two":   fileTwo,
+		"a/c/three": fileThree,
+	} {
+		_, err = obj.PutObject(context.Background(), bucket, objName, mustGetPutObjReader(t, strings.NewReader(value), int64(len(value)), "", ""), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	test := func(token string) (int, []byte) {
 		rec := httptest.NewRecorder()
@@ -957,7 +964,7 @@ func testWebHandlerDownloadZip(obj ObjectLayer, instanceType string, t TestErrHa
 			return 0, nil
 		}
 		var req *http.Request
-		req, err = http.NewRequest("POST", path, bytes.NewBuffer(argsData))
+		req, err = http.NewRequest(http.MethodPost, path, bytes.NewBuffer(argsData))
 
 		if err != nil {
 			t.Fatalf("Cannot create upload request, %v", err)
@@ -1036,7 +1043,7 @@ func testWebPresignedGetHandler(obj ObjectLayer, instanceType string, t TestErrH
 		Expiry:     1000,
 	}
 	presignGetRep := &PresignedGetRep{}
-	req, err := newTestWebRPCRequest("Web.PresignedGet", authorization, presignGetReq)
+	req, err := newTestWebRPCRequest("web.PresignedGet", authorization, presignGetReq)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -1055,7 +1062,7 @@ func testWebPresignedGetHandler(obj ObjectLayer, instanceType string, t TestErrH
 	// Initialize a new api recorder.
 	arec := httptest.NewRecorder()
 
-	req, err = newTestRequest("GET", presignGetRep.URL, 0, nil)
+	req, err = newTestRequest(http.MethodGet, presignGetRep.URL, 0, nil)
 	req.Header.Del("x-amz-content-sha256")
 	if err != nil {
 		t.Fatal("Failed to initialized a new request", err)
@@ -1081,7 +1088,7 @@ func testWebPresignedGetHandler(obj ObjectLayer, instanceType string, t TestErrH
 		ObjectName: "",
 	}
 	presignGetRep = &PresignedGetRep{}
-	req, err = newTestWebRPCRequest("Web.PresignedGet", authorization, presignGetReq)
+	req, err = newTestWebRPCRequest("web.PresignedGet", authorization, presignGetReq)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -1133,7 +1140,7 @@ func TestWebCheckAuthorization(t *testing.T) {
 	}
 	for _, rpcCall := range webRPCs {
 		reply := &WebGenericRep{}
-		req, nerr := newTestWebRPCRequest("Web."+rpcCall, "Bearer fooauthorization", &WebGenericArgs{})
+		req, nerr := newTestWebRPCRequest("web."+rpcCall, "Bearer fooauthorization", &WebGenericArgs{})
 		if nerr != nil {
 			t.Fatalf("Test %s: Failed to create HTTP request: <ERROR> %v", rpcCall, nerr)
 		}
@@ -1152,8 +1159,8 @@ func TestWebCheckAuthorization(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	// Test authorization of Web.Download
-	req, err := http.NewRequest("GET", "/minio/download/bucket/object?token=wrongauth", nil)
+	// Test authorization of web.Download
+	req, err := http.NewRequest(http.MethodGet, "/minio/download/bucket/object?token=wrongauth", nil)
 	if err != nil {
 		t.Fatalf("Cannot create upload request, %v", err)
 	}
@@ -1168,9 +1175,9 @@ func TestWebCheckAuthorization(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	// Test authorization of Web.Upload
+	// Test authorization of web.Upload
 	content := []byte("temporary file's content")
-	req, err = http.NewRequest("PUT", "/minio/upload/bucket/object", nil)
+	req, err = http.NewRequest(http.MethodPut, "/minio/upload/bucket/object", nil)
 	req.Header.Set("Authorization", "Bearer foo-authorization")
 	req.Header.Set("User-Agent", "Mozilla")
 	req.Header.Set("Content-Length", strconv.Itoa(len(content)))
@@ -1217,17 +1224,17 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 	}
 
 	// Set faulty disks to Erasure backend
-	z := obj.(*erasureZones)
-	xl := z.zones[0].sets[0]
+	z := obj.(*erasureServerSets)
+	xl := z.serverSets[0].sets[0]
 	erasureDisks := xl.getDisks()
-	z.zones[0].erasureDisksMu.Lock()
+	z.serverSets[0].erasureDisksMu.Lock()
 	xl.getDisks = func() []StorageAPI {
 		for i, d := range erasureDisks {
 			erasureDisks[i] = newNaughtyDisk(d, nil, errFaultyDisk)
 		}
 		return erasureDisks
 	}
-	z.zones[0].erasureDisksMu.Unlock()
+	z.serverSets[0].erasureDisksMu.Unlock()
 
 	// Initialize web rpc endpoint.
 	apiRouter := initTestWebRPCEndPoint(obj)
@@ -1257,7 +1264,7 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 	for _, rpcCall := range webRPCs {
 		args := &rpcCall.ReqArgs
 		reply := &rpcCall.RepArgs
-		req, nerr := newTestWebRPCRequest("Web."+rpcCall.webRPCName, authorization, args)
+		req, nerr := newTestWebRPCRequest("web."+rpcCall.webRPCName, authorization, args)
 		if nerr != nil {
 			t.Fatalf("Test %s: Failed to create HTTP request: <ERROR> %v", rpcCall, nerr)
 		}
@@ -1271,10 +1278,10 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 		}
 	}
 
-	// Test Web.StorageInfo
+	// Test web.StorageInfo
 	storageInfoRequest := &WebGenericArgs{}
 	storageInfoReply := &StorageInfoRep{}
-	req, err := newTestWebRPCRequest("Web.StorageInfo", authorization, storageInfoRequest)
+	req, err := newTestWebRPCRequest("web.StorageInfo", authorization, storageInfoRequest)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP request: <ERROR> %v", err)
 	}
@@ -1287,8 +1294,8 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 		t.Fatalf("Failed %v", err)
 	}
 
-	// Test authorization of Web.Download
-	req, err = http.NewRequest("GET", "/minio/download/bucket/object?token="+authorization, nil)
+	// Test authorization of web.Download
+	req, err = http.NewRequest(http.MethodGet, "/minio/download/bucket/object?token="+authorization, nil)
 	if err != nil {
 		t.Fatalf("Cannot create upload request, %v", err)
 	}
@@ -1297,9 +1304,9 @@ func TestWebObjectLayerFaultyDisks(t *testing.T) {
 		t.Fatalf("Expected the response status to be 200, but instead found `%d`", rec.Code)
 	}
 
-	// Test authorization of Web.Upload
+	// Test authorization of web.Upload
 	content := []byte("temporary file's content")
-	req, err = http.NewRequest("PUT", "/minio/upload/bucket/object", nil)
+	req, err = http.NewRequest(http.MethodPut, "/minio/upload/bucket/object", nil)
 	req.Header.Set("Authorization", "Bearer "+authorization)
 	req.Header.Set("Content-Length", strconv.Itoa(len(content)))
 	req.Header.Set("x-amz-date", "20160814T114029Z")

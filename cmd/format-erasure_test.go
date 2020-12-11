@@ -18,61 +18,12 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
 )
-
-// Test get offline/online uuids.
-func TestGetUUIDs(t *testing.T) {
-	fmtV2 := newFormatErasureV3(4, 16)
-	formats := make([]*formatErasureV3, 64)
-
-	for i := 0; i < 4; i++ {
-		for j := 0; j < 16; j++ {
-			newFormat := *fmtV2
-			newFormat.Erasure.This = fmtV2.Erasure.Sets[i][j]
-			formats[i*16+j] = &newFormat
-		}
-	}
-
-	gotCount := len(getOnlineUUIDs(fmtV2, formats))
-	if gotCount != 64 {
-		t.Errorf("Expected online count '64', got '%d'", gotCount)
-	}
-
-	for i := 0; i < 4; i++ {
-		for j := 0; j < 16; j++ {
-			if j < 4 {
-				formats[i*16+j] = nil
-			}
-		}
-	}
-
-	gotCount = len(getOnlineUUIDs(fmtV2, formats))
-	if gotCount != 48 {
-		t.Errorf("Expected online count '48', got '%d'", gotCount)
-	}
-
-	gotCount = len(getOfflineUUIDs(fmtV2, formats))
-	if gotCount != 16 {
-		t.Errorf("Expected offline count '16', got '%d'", gotCount)
-	}
-
-	markUUIDsOffline(fmtV2, formats)
-	gotCount = 0
-	for i := range fmtV2.Erasure.Sets {
-		for j := range fmtV2.Erasure.Sets[i] {
-			if fmtV2.Erasure.Sets[i][j] == offlineDiskUUID {
-				gotCount++
-			}
-		}
-	}
-	if gotCount != 16 {
-		t.Errorf("Expected offline count '16', got '%d'", gotCount)
-	}
-}
 
 // tests fixFormatErasureV3 - fix format.json on all disks.
 func TestFixFormatV3(t *testing.T) {
@@ -92,7 +43,7 @@ func TestFixFormatV3(t *testing.T) {
 		}
 	}
 
-	format := newFormatErasureV3(1, 8)
+	format := newFormatErasureV3(1, 8, "CRCMOD")
 	formats := make([]*formatErasureV3, 8)
 
 	for j := 0; j < 8; j++ {
@@ -126,7 +77,7 @@ func TestFixFormatV3(t *testing.T) {
 
 // tests formatErasureV3ThisEmpty conditions.
 func TestFormatErasureEmpty(t *testing.T) {
-	format := newFormatErasureV3(1, 16)
+	format := newFormatErasureV3(1, 16, "CRCMOD")
 	formats := make([]*formatErasureV3, 16)
 
 	for j := 0; j < 16; j++ {
@@ -323,16 +274,16 @@ func TestCheckFormatErasureValue(t *testing.T) {
 // Tests getFormatErasureInQuorum()
 func TestGetFormatErasureInQuorumCheck(t *testing.T) {
 	setCount := 2
-	drivesPerSet := 16
+	setDriveCount := 16
 
-	format := newFormatErasureV3(setCount, drivesPerSet)
+	format := newFormatErasureV3(setCount, setDriveCount, "CRCMOD")
 	formats := make([]*formatErasureV3, 32)
 
 	for i := 0; i < setCount; i++ {
-		for j := 0; j < drivesPerSet; j++ {
+		for j := 0; j < setDriveCount; j++ {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
-			formats[i*drivesPerSet+j] = newFormat
+			formats[i*setDriveCount+j] = newFormat
 		}
 	}
 
@@ -389,16 +340,16 @@ func TestGetFormatErasureInQuorumCheck(t *testing.T) {
 // Tests formatErasureGetDeploymentID()
 func TestGetErasureID(t *testing.T) {
 	setCount := 2
-	drivesPerSet := 8
+	setDriveCount := 8
 
-	format := newFormatErasureV3(setCount, drivesPerSet)
+	format := newFormatErasureV3(setCount, setDriveCount, "CRCMOD")
 	formats := make([]*formatErasureV3, 16)
 
 	for i := 0; i < setCount; i++ {
-		for j := 0; j < drivesPerSet; j++ {
+		for j := 0; j < setDriveCount; j++ {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
-			formats[i*drivesPerSet+j] = newFormat
+			formats[i*setDriveCount+j] = newFormat
 		}
 	}
 
@@ -436,25 +387,25 @@ func TestGetErasureID(t *testing.T) {
 	}
 
 	formats[2].ID = "bad-id"
-	if _, err = formatErasureGetDeploymentID(quorumFormat, formats); err != errCorruptedFormat {
-		t.Fatal("Unexpected Success")
+	if _, err = formatErasureGetDeploymentID(quorumFormat, formats); !errors.Is(err, errCorruptedFormat) {
+		t.Fatalf("Unexpect error %s", err)
 	}
 }
 
 // Initialize new format sets.
 func TestNewFormatSets(t *testing.T) {
 	setCount := 2
-	drivesPerSet := 16
+	setDriveCount := 16
 
-	format := newFormatErasureV3(setCount, drivesPerSet)
+	format := newFormatErasureV3(setCount, setDriveCount, "CRCMOD")
 	formats := make([]*formatErasureV3, 32)
 	errs := make([]error, 32)
 
 	for i := 0; i < setCount; i++ {
-		for j := 0; j < drivesPerSet; j++ {
+		for j := 0; j < setDriveCount; j++ {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
-			formats[i*drivesPerSet+j] = newFormat
+			formats[i*setDriveCount+j] = newFormat
 		}
 	}
 
@@ -466,7 +417,7 @@ func TestNewFormatSets(t *testing.T) {
 	// 16th disk is unformatted.
 	errs[15] = errUnformattedDisk
 
-	newFormats := newHealFormatSets(quorumFormat, setCount, drivesPerSet, formats, errs)
+	newFormats := newHealFormatSets(quorumFormat, setCount, setDriveCount, formats, errs)
 	if newFormats == nil {
 		t.Fatal("Unexpected failure")
 	}
@@ -474,6 +425,9 @@ func TestNewFormatSets(t *testing.T) {
 	// Check if deployment IDs are preserved.
 	for i := range newFormats {
 		for j := range newFormats[i] {
+			if newFormats[i][j] == nil {
+				continue
+			}
 			if newFormats[i][j].ID != quorumFormat.ID {
 				t.Fatal("Deployment id in the new format is lost")
 			}
