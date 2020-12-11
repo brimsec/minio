@@ -108,7 +108,7 @@ var globalCLIContext = struct {
 	JSON, Quiet    bool
 	Anonymous      bool
 	Addr           string
-	WritePortFile       string
+	WritePortFile  string
 	StrictS3Compat bool
 }{}
 
